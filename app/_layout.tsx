@@ -1,24 +1,83 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
-import 'react-native-reanimated';
+import { Stack } from "expo-router";
+import {
+  ActivityIndicator,
+  StyleSheet,
+  View,
+} from "react-native";
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
+import { IncomingCallProvider } from "../components/IncomingCallProvider";
 
-export const unstable_settings = {
-  anchor: '(tabs)',
-};
+import {
+  AuthProvider,
+  useAuth,
+} from "../contexts/AuthContext";
 
-export default function RootLayout() {
-  const colorScheme = useColorScheme();
+function RootNavigator() {
+  const { session, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#176B5B" />
+      </View>
+    );
+  }
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Protected guard={!session}>
+        <Stack.Screen name="sign-in" />
+        <Stack.Screen name="sign-up" />
+      </Stack.Protected>
+
+    <Stack.Protected guard={Boolean(session)}>
+      <Stack.Screen name="(tabs)" />
+
+      <Stack.Screen
+        name="call/[callId]"
+        options={{ headerShown: false }}
+      />
+
+      <Stack.Screen
+        name="calls"
+        options={{ headerShown: false }}
+      />
+
+      <Stack.Screen
+        name="contact/[userId]"
+        options={{ headerShown: false }}
+      />
+
+      <Stack.Screen
+        name="chat/[conversationId]"
+        options={{
+          headerShown: true,
+          title: "Chat",
+          headerBackTitle: "Back",
+        }}
+      />
+    </Stack.Protected>
+	  
+	  
+    </Stack>
   );
 }
+
+export default function RootLayout() {
+  return (
+    <AuthProvider>
+      <IncomingCallProvider>
+        <RootNavigator />
+      </IncomingCallProvider>
+    </AuthProvider>
+  );
+}
+
+const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFFFFF",
+  },
+});

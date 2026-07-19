@@ -2,14 +2,29 @@
   "expo": {
     "name": "global-qall",
     "slug": "global-qall",
-    "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
     "scheme": "globalqall",
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/images/icon.png",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "bundleIdentifier": "com.gseremba.globalqall",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Global Qall uses your microphone for audio calls.",
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "Global Qall uses your camera for video calls.",
+        "UIBackgroundModes": [
+          "audio",
+          "voip",
+          "remote-notification"
+        ]
+      },
+      "bitcode": false,
+      "entitlements": {
+        "aps-environment": "development"
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +34,22 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "BLUETOOTH",
+        "BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WAKE_LOCK",
+        "android.permission.BLUETOOTH"
+      ],
+      "package": "com.gseremba.globalqall"
     },
     "web": {
       "output": "static",
@@ -38,11 +68,28 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "@config-plugins/react-native-webrtc",
+      "@config-plugins/react-native-callkeep",
+      "expo-video",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Global Qall uses your microphone to record and send voice messages."
+        }
+      ],
+      "expo-asset", 
+	  "./plugins/withGlobalQallPushKit"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "46c4b259-7198-4b51-b4e9-660f935beaf2"
+      }
     }
   }
 }

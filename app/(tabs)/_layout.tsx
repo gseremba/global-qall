@@ -1,33 +1,107 @@
-import { Tabs } from 'expo-router';
-import React from 'react';
+import Ionicons from "@expo/vector-icons/Ionicons";
+import { Tabs } from "expo-router";
 
-import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
-export default function TabLayout() {
-  const colorScheme = useColorScheme();
-
+export default function TabsLayout() {
   return (
     <Tabs
+      initialRouteName="index"
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
-        headerShown: false,
-        tabBarButton: HapticTab,
-      }}>
+        headerStyle: {
+          backgroundColor: "#FFFFFF",
+        },
+        headerTitleStyle: {
+          color: "#18201E",
+          fontWeight: "700",
+        },
+        headerShadowVisible: false,
+        tabBarActiveTintColor: "#176B5B",
+        tabBarInactiveTintColor: "#7B8582",
+        tabBarHideOnKeyboard: true,
+        tabBarStyle: {
+          height: 66,
+          paddingTop: 7,
+          paddingBottom: 8,
+          backgroundColor: "#FFFFFF",
+          borderTopColor: "#E4E9E7",
+        },
+        tabBarLabelStyle: {
+          fontSize: 11,
+          fontWeight: "600",
+        },
+      }}
+    >
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
+          title: "Home",
+          headerTitle: "Global Qall",
+          tabBarIcon: ({ color, size, focused }) => (
+            <Ionicons
+              name={focused ? "home" : "home-outline"}
+              color={color}
+              size={size}
+            />
+          ),
         }}
       />
+
       <Tabs.Screen
-        name="explore"
+        name="chats"
         options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
+          title: "Chats",
+          tabBarIcon: ({ color, size, focused }) => (
+            <Ionicons
+              name={
+                focused
+                  ? "chatbubbles"
+                  : "chatbubbles-outline"
+              }
+              color={color}
+              size={size}
+            />
+          ),
+        }}
+      />
+
+      <Tabs.Screen
+        name="qall"
+        options={{
+          title: "Qall",
+          tabBarIcon: ({ color, size, focused }) => (
+            <Ionicons
+              name={focused ? "call" : "call-outline"}
+              color={color}
+              size={size}
+            />
+          ),
+        }}
+      />
+
+      <Tabs.Screen
+        name="contacts"
+        options={{
+          title: "Contacts",
+          tabBarIcon: ({ color, size, focused }) => (
+            <Ionicons
+              name={focused ? "people" : "people-outline"}
+              color={color}
+              size={size}
+            />
+          ),
+        }}
+      />
+
+      <Tabs.Screen
+        name="account"
+        options={{
+          title: "Account",
+          tabBarIcon: ({ color, size, focused }) => (
+            <Ionicons
+              name={focused ? "person" : "person-outline"}
+              color={color}
+              size={size}
+            />
+          ),
         }}
       />
     </Tabs>

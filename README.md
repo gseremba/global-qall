@@ -1,50 +1,45 @@
-# Welcome to your Expo app 👋
+# Global Qall — Sprint 8A Voice Calling (Foreground MVP)
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+## What is included
 
-## Get started
+- One-to-one foreground voice calls between two signed-in users.
+- Outgoing call from the Qall keypad, Contact Profile, and chat header.
+- Global incoming-call listener.
+- Incoming call screen with Accept and Decline.
+- WebRTC offer, answer, and ICE exchange through Supabase.
+- Mute/unmute, hang up, connection state, and call timer.
+- Avatar, display name, and Qall ID on the call screen.
 
-1. Install dependencies
+## Important scope
 
-   ```bash
-   npm install
-   ```
+This is Sprint 8A's foreground MVP. Both users must have Global Qall open and connected to Metro. Background ringing, lock-screen calls, PushKit, CallKit, speaker routing, Bluetooth controls, and TURN deployment are later stages.
 
-2. Start the app
+## Installation
 
-   ```bash
-   npx expo start
-   ```
+1. Back up your project.
+2. Run `supabase/sprint-8a-voice-calling.sql` in Supabase SQL Editor.
+3. Copy the included files into the matching project locations.
+4. Confirm Realtime replication is enabled for `calls` and `call_ice_candidates`. The SQL attempts to enable it.
+5. Run:
 
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```powershell
+npx expo start --dev-client --tunnel --clear
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Your current `package.json` already contains `react-native-webrtc`, and `app.json` already contains the WebRTC config plugin. If the installed iOS development client was built after those were added, no rebuild is needed. Otherwise build a new client:
 
-## Learn more
+```powershell
+eas build --profile development --platform ios --clear-cache
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+## Test
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+- Install/open the same development build on two registered iPhones.
+- Sign in with two different Global Qall accounts.
+- Keep both apps foregrounded.
+- From one phone, open the other contact and tap **Qall**.
+- Accept on the second phone.
 
-## Join the community
+## Production requirement
 
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+Public Google STUN is only enough for initial testing. Production calling needs authenticated TURN infrastructure because some cellular, corporate, and restrictive NAT networks cannot establish a direct peer-to-peer path.

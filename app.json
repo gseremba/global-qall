@@ -3,6 +3,11 @@
     "name": "global-qall",
     "slug": "global-qall",
     "scheme": "globalqall",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],	
     "version": "1.0.0",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
@@ -79,7 +84,7 @@
         }
       ],
       "expo-asset", 
-	  "./plugins/withGlobalQallPushKit"
+	  "./modules/global-qall-voip/app.plugin.js"
     ],
     "experiments": {
       "typedRoutes": true,

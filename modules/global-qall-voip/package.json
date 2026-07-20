@@ -4,11 +4,12 @@
   "description": "Global Qall native iOS PushKit and CallKit bridge for Expo SDK 54",
   "main": "src/index.ts",
   "types": "src/index.ts",
-  "files": ["ios", "src", "plugin", "app.plugin.js", "expo-module.config.json", "global-qall-voip.podspec"],
+  "files": "files": ["ios","src","plugin","app.plugin.js","expo-module.config.json","GlobalQallVoip.podspec"],
   "peerDependencies": {
     "expo": "*",
     "react-native": "*",
     "react-native-callkeep": "*",
     "react-native-voip-push-notification": "*"
   }
+  
 }

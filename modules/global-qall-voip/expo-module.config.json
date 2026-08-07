@@ -2,6 +2,8 @@
   "platforms": ["apple"],
   "apple": {
     "modules": ["GlobalQallVoipModule"],
-    "appDelegateSubscribers": ["GlobalQallVoipAppDelegateSubscriber"]
+    "appDelegateSubscribers": [
+      "GlobalQallVoipAppDelegateSubscriber"
+    ]
   }
 }

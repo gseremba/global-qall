@@ -3,7 +3,9 @@ import Foundation
 import PushKit
 import UIKit
 
-public final class GlobalQallVoipAppDelegateSubscriber: ExpoAppDelegateSubscriber, PKPushRegistryDelegate {
+public final class GlobalQallVoipAppDelegateSubscriber: 
+  ExpoAppDelegateSubscriber, 
+  PKPushRegistryDelegate {
   private var registry: PKPushRegistry?
 
   public func application(
@@ -24,7 +26,7 @@ public final class GlobalQallVoipAppDelegateSubscriber: ExpoAppDelegateSubscribe
     }
   }
 
-  public func pushRegistry(
+  @objc public func pushRegistry(
     _ registry: PKPushRegistry,
     didUpdate pushCredentials: PKPushCredentials,
     for type: PKPushType
@@ -34,14 +36,14 @@ public final class GlobalQallVoipAppDelegateSubscriber: ExpoAppDelegateSubscribe
     GlobalQallVoipNativeBridge.forwardUpdatedCredentials(pushCredentials, forType: type)
   }
 
-  public func pushRegistry(
+  @objc public func pushRegistry(
     _ registry: PKPushRegistry,
     didInvalidatePushTokenFor type: PKPushType
   ) {
     GlobalQallVoipStore.saveToken("")
   }
 
-  public func pushRegistry(
+  @objc public func pushRegistry(
     _ registry: PKPushRegistry,
     didReceiveIncomingPushWith payload: PKPushPayload,
     for type: PKPushType,

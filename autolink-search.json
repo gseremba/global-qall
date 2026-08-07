@@ -1,0 +1,536 @@
+﻿[Object: null prototype] {
+  [32m'global-qall-voip'[39m: {
+    name: [32m'global-qall-voip'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\modules\\global-qall-voip'[39m,
+    version: [32m'10.0.0'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m ],
+        apple: {
+          modules: [ [32m'GlobalQallVoipModule'[39m ],
+          appDelegateSubscribers: [ [32m'GlobalQallVoipAppDelegateSubscriber'[39m ]
+        }
+      }
+    },
+    duplicates: []
+  },
+  expo: {
+    name: [32m'expo'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo'[39m,
+    version: [32m'54.0.36'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'ExpoFetchModule'[39m ], podspecPath: [32m'Expo.podspec'[39m },
+        android: { modules: [ [32m'expo.modules.fetch.ExpoFetchModule'[39m ] }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-asset'[39m: {
+    name: [32m'expo-asset'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-asset'[39m,
+    version: [32m'12.0.13'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m, [32m'web'[39m ],
+        apple: { modules: [ [32m'AssetModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.asset.AssetModule'[39m ],
+          publication: {
+            groupId: [32m'expo.modules.asset'[39m,
+            artifactId: [32m'expo.modules.asset'[39m,
+            version: [32m'12.0.13'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-audio'[39m: {
+    name: [32m'expo-audio'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-audio'[39m,
+    version: [32m'1.1.1'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'AudioModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.audio.AudioModule'[39m ],
+          publication: {
+            groupId: [32m'expo.modules.audio'[39m,
+            artifactId: [32m'expo.modules.audio'[39m,
+            version: [32m'1.1.1'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-clipboard'[39m: {
+    name: [32m'expo-clipboard'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-clipboard'[39m,
+    version: [32m'8.0.8'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m, [32m'web'[39m ],
+        apple: { modules: [ [32m'ClipboardModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.clipboard.ClipboardModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.clipboard'[39m,
+            version: [32m'8.0.8'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-constants'[39m: {
+    name: [32m'expo-constants'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-constants'[39m,
+    version: [32m'18.0.13'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m, [32m'web'[39m ],
+        apple: { modules: [ [32m'ConstantsModule'[39m ] },
+        android: { modules: [ [32m'expo.modules.constants.ConstantsModule'[39m ] }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-dev-client'[39m: {
+    name: [32m'expo-dev-client'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-dev-client'[39m,
+    version: [32m'6.0.21'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: { platforms: [ [32m'apple'[39m, [32m'android'[39m ] }
+    },
+    duplicates: []
+  },
+  [32m'expo-document-picker'[39m: {
+    name: [32m'expo-document-picker'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-document-picker'[39m,
+    version: [32m'14.0.8'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'DocumentPickerModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.documentpicker.DocumentPickerModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.documentpicker'[39m,
+            version: [32m'14.0.8'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-font'[39m: {
+    name: [32m'expo-font'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-font'[39m,
+    version: [32m'14.0.12'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m, [32m'web'[39m ],
+        apple: { modules: [ [32m'FontLoaderModule'[39m, [32m'FontUtilsModule'[39m ] },
+        android: {
+          modules: [
+            [32m'expo.modules.font.FontLoaderModule'[39m,
+            [32m'expo.modules.font.FontUtilsModule'[39m
+          ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.font'[39m,
+            version: [32m'14.0.12'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-haptics'[39m: {
+    name: [32m'expo-haptics'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-haptics'[39m,
+    version: [32m'15.0.8'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'HapticsModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.haptics.HapticsModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.haptics'[39m,
+            version: [32m'15.0.8'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-image'[39m: {
+    name: [32m'expo-image'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-image'[39m,
+    version: [32m'3.0.11'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'ImageModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.image.ExpoImageModule'[39m ],
+          publication: {
+            groupId: [32m'BareExpo'[39m,
+            artifactId: [32m'expo.modules.image'[39m,
+            version: [32m'3.0.11'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-image-picker'[39m: {
+    name: [32m'expo-image-picker'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-image-picker'[39m,
+    version: [32m'17.0.11'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'ImagePickerModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.imagepicker.ImagePickerModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.imagepicker'[39m,
+            version: [32m'17.0.11'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-linking'[39m: {
+    name: [32m'expo-linking'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-linking'[39m,
+    version: [32m'8.0.12'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m, [32m'web'[39m ],
+        apple: {
+          modules: [ [32m'ExpoLinkingModule'[39m ],
+          appDelegateSubscribers: [ [32m'LinkingAppDelegateSubscriber'[39m ]
+        },
+        android: {
+          modules: [ [32m'expo.modules.linking.ExpoLinkingModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.linking'[39m,
+            version: [32m'8.0.12'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-router'[39m: {
+    name: [32m'expo-router'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-router'[39m,
+    version: [32m'6.0.24'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'web'[39m ],
+        apple: {
+          modules: [ [32m'ExpoHeadModule'[39m, [32m'LinkPreviewNativeModule'[39m ],
+          appDelegateSubscribers: [ [32m'ExpoHeadAppDelegateSubscriber'[39m ]
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-splash-screen'[39m: {
+    name: [32m'expo-splash-screen'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-splash-screen'[39m,
+    version: [32m'31.0.13'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: {
+          modules: [ [32m'SplashScreenModule'[39m ],
+          appDelegateSubscribers: [ [32m'SplashScreenAppDelegateSubscriber'[39m ]
+        },
+        android: {
+          modules: [ [32m'expo.modules.splashscreen.SplashScreenModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.splashscreen'[39m,
+            version: [32m'31.0.13'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-symbols'[39m: {
+    name: [32m'expo-symbols'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-symbols'[39m,
+    version: [32m'1.0.8'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m ],
+        apple: { modules: [ [32m'SymbolModule'[39m ] }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-system-ui'[39m: {
+    name: [32m'expo-system-ui'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-system-ui'[39m,
+    version: [32m'6.0.9'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'ExpoSystemUIModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.systemui.SystemUIModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.systemui'[39m,
+            version: [32m'6.0.9'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-video'[39m: {
+    name: [32m'expo-video'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-video'[39m,
+    version: [32m'3.0.16'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'VideoModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.video.VideoModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.video'[39m,
+            version: [32m'3.0.16'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-web-browser'[39m: {
+    name: [32m'expo-web-browser'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-web-browser'[39m,
+    version: [32m'15.0.11'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'WebBrowserModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.webbrowser.WebBrowserModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.webbrowser'[39m,
+            version: [32m'15.0.11'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-file-system'[39m: {
+    name: [32m'expo-file-system'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo\\node_modules\\expo-file-system'[39m,
+    version: [32m'19.0.23'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: {
+          modules: [ [32m'FileSystemModule'[39m, [32m'FileSystemLegacyModule'[39m ],
+          appDelegateSubscribers: [ [32m'FileSystemBackgroundSessionHandler'[39m ]
+        },
+        android: {
+          modules: [
+            [32m'expo.modules.filesystem.FileSystemModule'[39m,
+            [32m'expo.modules.filesystem.legacy.FileSystemLegacyModule'[39m
+          ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.filesystem'[39m,
+            version: [32m'19.0.23'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-keep-awake'[39m: {
+    name: [32m'expo-keep-awake'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo\\node_modules\\expo-keep-awake'[39m,
+    version: [32m'15.0.8'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { modules: [ [32m'KeepAwakeModule'[39m ] },
+        android: {
+          modules: [ [32m'expo.modules.keepawake.KeepAwakeModule'[39m ],
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.keepawake'[39m,
+            version: [32m'15.0.8'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-modules-core'[39m: {
+    name: [32m'expo-modules-core'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-modules-core'[39m,
+    version: [32m'3.0.30'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: { podspecPath: [32m'./ExpoModulesCore.podspec'[39m },
+        android: {
+          gradlePlugins: [
+            {
+              id: [32m'expo-module-gradle-plugin'[39m,
+              group: [32m'expo.modules'[39m,
+              sourceDir: [32m'expo-module-gradle-plugin'[39m,
+              applyToRootProject: [33mfalse[39m
+            }
+          ]
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-dev-launcher'[39m: {
+    name: [32m'expo-dev-launcher'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-dev-launcher'[39m,
+    version: [32m'6.0.21'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: {
+          podspecPath: [32m'expo-dev-launcher.podspec'[39m,
+          swiftModuleName: [32m'EXDevLauncher'[39m,
+          appDelegateSubscribers: [ [32m'ExpoDevLauncherAppDelegateSubscriber'[39m ],
+          reactDelegateHandlers: [ [32m'ExpoDevLauncherReactDelegateHandler'[39m ],
+          debugOnly: [33mtrue[39m
+        },
+        android: {
+          gradlePlugins: [
+            {
+              id: [32m'expo-dev-launcher-gradle-plugin'[39m,
+              group: [32m'expo.modules'[39m,
+              sourceDir: [32m'expo-dev-launcher-gradle-plugin'[39m
+            }
+          ]
+        }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-dev-menu'[39m: {
+    name: [32m'expo-dev-menu'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-dev-menu'[39m,
+    version: [32m'7.0.19'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        apple: {
+          podspecPath: [32m'expo-dev-menu.podspec'[39m,
+          swiftModuleName: [32m'EXDevMenu'[39m,
+          modules: [
+            [32m'DevMenuModule'[39m,
+            [32m'DevMenuInternalModule'[39m,
+            [32m'DevMenuPreferences'[39m
+          ],
+          reactDelegateHandlers: [ [32m'ExpoDevMenuReactDelegateHandler'[39m ],
+          debugOnly: [33mtrue[39m
+        },
+        android: { modules: [ [32m'expo.modules.devmenu.modules.DevMenuModule'[39m ] }
+      }
+    },
+    duplicates: []
+  },
+  [32m'expo-dev-menu-interface'[39m: {
+    name: [32m'expo-dev-menu-interface'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-dev-menu-interface'[39m,
+    version: [32m'2.0.0'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: { platforms: [ [32m'apple'[39m, [32m'android'[39m ] }
+    },
+    duplicates: []
+  },
+  [32m'expo-manifests'[39m: {
+    name: [32m'expo-manifests'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-manifests'[39m,
+    version: [32m'1.0.11'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: { platforms: [ [32m'apple'[39m, [32m'android'[39m ] }
+    },
+    duplicates: []
+  },
+  [32m'expo-updates-interface'[39m: {
+    name: [32m'expo-updates-interface'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-updates-interface'[39m,
+    version: [32m'2.0.0'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: { platforms: [ [32m'apple'[39m, [32m'android'[39m ] }
+    },
+    duplicates: []
+  },
+  [32m'expo-json-utils'[39m: {
+    name: [32m'expo-json-utils'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-json-utils'[39m,
+    version: [32m'0.15.0'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: { platforms: [ [32m'apple'[39m, [32m'android'[39m ] }
+    },
+    duplicates: []
+  },
+  [32m'expo-image-loader'[39m: {
+    name: [32m'expo-image-loader'[39m,
+    path: [32m'C:\\usr\\apps\\global-qall\\node_modules\\expo-image-loader'[39m,
+    version: [32m'6.0.0'[39m,
+    config: ExpoModuleConfig {
+      rawConfig: {
+        platforms: [ [32m'apple'[39m, [32m'android'[39m ],
+        android: {
+          publication: {
+            groupId: [32m'host.exp.exponent'[39m,
+            artifactId: [32m'expo.modules.imageloader'[39m,
+            version: [32m'6.0.0'[39m,
+            repository: [32m'local-maven-repo'[39m
+          }
+        }
+      }
+    },
+    duplicates: []
+  }
+}

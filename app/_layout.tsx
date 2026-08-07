@@ -1,4 +1,5 @@
 import { Stack } from "expo-router";
+import { useEffect } from "react";
 import {
   ActivityIndicator,
   StyleSheet,
@@ -11,6 +12,39 @@ import {
   AuthProvider,
   useAuth,
 } from "../contexts/AuthContext";
+
+import {
+  initializeVoipPushEvents,
+  setVoipPushUser,
+} from "../lib/voipPush";
+
+function VoipPushRegistration() {
+  const { session, loading } = useAuth();
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined;
+
+    try {
+      cleanup = initializeVoipPushEvents();
+    } catch (error) {
+      console.error("VoIP initialization failed:", error);
+    }
+
+    return () => {
+      cleanup?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    setVoipPushUser(session?.user?.id ?? null);
+  }, [session?.user?.id, loading]);
+
+  return null;
+}
 
 function RootNavigator() {
   const { session, loading } = useAuth();
@@ -30,35 +64,33 @@ function RootNavigator() {
         <Stack.Screen name="sign-up" />
       </Stack.Protected>
 
-    <Stack.Protected guard={Boolean(session)}>
-      <Stack.Screen name="(tabs)" />
+      <Stack.Protected guard={Boolean(session)}>
+        <Stack.Screen name="(tabs)" />
 
-      <Stack.Screen
-        name="call/[callId]"
-        options={{ headerShown: false }}
-      />
+        <Stack.Screen
+          name="call/[callId]"
+          options={{ headerShown: false }}
+        />
 
-      <Stack.Screen
-        name="calls"
-        options={{ headerShown: false }}
-      />
+        <Stack.Screen
+          name="calls"
+          options={{ headerShown: false }}
+        />
 
-      <Stack.Screen
-        name="contact/[userId]"
-        options={{ headerShown: false }}
-      />
+        <Stack.Screen
+          name="contact/[userId]"
+          options={{ headerShown: false }}
+        />
 
-      <Stack.Screen
-        name="chat/[conversationId]"
-        options={{
-          headerShown: true,
-          title: "Chat",
-          headerBackTitle: "Back",
-        }}
-      />
-    </Stack.Protected>
-	  
-	  
+        <Stack.Screen
+          name="chat/[conversationId]"
+          options={{
+            headerShown: true,
+            title: "Chat",
+            headerBackTitle: "Back",
+          }}
+        />
+      </Stack.Protected>
     </Stack>
   );
 }
@@ -66,6 +98,8 @@ function RootNavigator() {
 export default function RootLayout() {
   return (
     <AuthProvider>
+      <VoipPushRegistration />
+
       <IncomingCallProvider>
         <RootNavigator />
       </IncomingCallProvider>

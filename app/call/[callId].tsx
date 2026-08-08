@@ -68,6 +68,25 @@ const RTC_CONFIGURATION = {
 
 const UNANSWERED_TIMEOUT_MS = 35_000;
 const RECONNECT_GRACE_MS = 12_000;
+const TERMINAL_CALL_STATUSES = new Set([
+  "declined",
+  "ended",
+  "missed",
+  "failed",
+]);
+
+function isTerminalCallStatus(status: string): boolean {
+  return TERMINAL_CALL_STATUSES.has(status);
+}
+
+
+function closeCallScreen() {
+  if (router.canGoBack()) {
+    router.back();
+  } else {
+    router.replace("/chat");
+  }
+}
 
 type OtherProfile = {
   id: string;
@@ -490,20 +509,31 @@ export default function CallScreen() {
           call?.call_type === "video",
       });
       await peer.setLocalDescription(offer);
-      const { error } = await supabase
+      const { data: offerUpdate, error } = await supabase
         .from("calls")
         .update({ offer: offer.toJSON ? offer.toJSON() : offer })
-        .eq("id", callId);
+        .eq("id", callId)
+        .eq("status", "ringing")
+        .select("id")
+        .maybeSingle();
       if (error) throw error;
+
+      if (!offerUpdate) {
+        cleanupMedia();
+        endNativeCall(callId, CALLKIT_END_REASONS.REMOTE_ENDED);
+        setConnectionLabel("Call no longer available");
+        return;
+      }
+
       setConnectionLabel("Ringing…");
 
       const { data: latestCall } = await supabase
         .from("calls")
-        .select("answer")
+        .select("answer, status")
         .eq("id", callId)
         .maybeSingle();
 
-      if (latestCall?.answer) {
+      if (latestCall?.status === "accepted" && latestCall?.answer) {
         await applyRemoteAnswer(latestCall.answer as Record<string, unknown>);
       }
     } finally {
@@ -513,6 +543,7 @@ export default function CallScreen() {
     applyRemoteAnswer,
     call?.call_type,
     callId,
+    cleanupMedia,
     preparePeer,
   ]);
 
@@ -528,15 +559,28 @@ export default function CallScreen() {
       const answer = await peer.createAnswer();
       await peer.setLocalDescription(answer);
       const now = new Date().toISOString();
-      const { error } = await supabase
+      const { data: acceptedTransition, error } = await supabase
         .from("calls")
         .update({
           answer: answer.toJSON ? answer.toJSON() : answer,
           status: "accepted",
           answered_at: now,
         })
-        .eq("id", callId);
+        .eq("id", callId)
+        .eq("status", "ringing")
+        .select("id, status")
+        .maybeSingle();
       if (error) throw error;
+
+      if (!acceptedTransition) {
+        // Another terminal transition (decline, timeout, or caller cancel)
+        // won the race before this answer reached the database.
+        cleanupMedia();
+        endNativeCall(callId, CALLKIT_END_REASONS.REMOTE_ENDED);
+        setConnectionLabel("Call no longer available");
+        return;
+      }
+
       setConnectionLabel("Connecting…");
     } catch (error) {
       Alert.alert(
@@ -549,6 +593,7 @@ export default function CallScreen() {
   }, [
     call,
     callId,
+    cleanupMedia,
     flushCandidates,
     preparePeer,
     preparing,
@@ -578,36 +623,144 @@ export default function CallScreen() {
         return;
       }
 
+      // Lock this device against double taps while the conditional update is
+      // in flight. If the database update itself fails, release the lock so
+      // the user can retry.
       endedLocallyRef.current = true;
-      cleanupMedia();
-      endNativeCall(
-        callId,
-        status === "missed"
-          ? CALLKIT_END_REASONS.MISSED
-          : status === "failed"
-            ? CALLKIT_END_REASONS.FAILED
-            : CALLKIT_END_REASONS.REMOTE_ENDED,
-      );
+
+      const expectedStatuses: CallStatus[] =
+        status === "declined" || status === "missed"
+          ? ["ringing"]
+          : status === "ended"
+            ? ["accepted"]
+            : status === "failed"
+              ? ["ringing", "accepted"]
+              : [];
 
       try {
+        if (expectedStatuses.length > 0) {
+          const { data: transition, error: transitionError } = await supabase
+            .from("calls")
+            .update({ status })
+            .eq("id", callId)
+            .in("status", expectedStatuses)
+            .select("id, status")
+            .maybeSingle();
+
+          if (transitionError) {
+            throw transitionError;
+          }
+
+          if (!transition) {
+            // Another device/action already changed the call. Never overwrite
+            // the winning state; just synchronize local/native UI.
+            const { data: latest } = await supabase
+              .from("calls")
+              .select("status")
+              .eq("id", callId)
+              .maybeSingle();
+
+            cleanupMedia();
+            endNativeCall(
+              callId,
+              latest?.status === "missed"
+                ? CALLKIT_END_REASONS.MISSED
+                : latest?.status === "failed"
+                  ? CALLKIT_END_REASONS.FAILED
+                  : latest?.status === "declined"
+                    ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
+                    : CALLKIT_END_REASONS.REMOTE_ENDED,
+            );
+            closeCallScreen();
+            return;
+          }
+        }
+
+        cleanupMedia();
+
+        const nativeEndReason =
+          status === "missed" && reason !== "cancelled_by_caller"
+            ? CALLKIT_END_REASONS.MISSED
+            : status === "failed"
+              ? CALLKIT_END_REASONS.FAILED
+              : status === "declined"
+                ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
+                : CALLKIT_END_REASONS.REMOTE_ENDED;
+
+        endNativeCall(callId, nativeEndReason);
+
+        // Preserve the existing helper's bookkeeping (reason/history fields).
+        // The status was already claimed conditionally above, so this call can
+        // no longer steal a transition from answer/decline/timeout.
         await finishVoiceCall(
           callId,
           status,
           reason
         );
       } catch (error) {
+        endedLocallyRef.current = false;
         console.warn(
           "Could not finish call:",
           error instanceof Error
             ? error.message
             : error
         );
+        return;
       }
 
-      router.back();
+      closeCallScreen();
     },
     [callId, cleanupMedia]
   );
+
+  const finishMissedIfStillRinging = useCallback(
+    async (reason = "unanswered") => {
+      if (!callId || endedLocallyRef.current) {
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("calls")
+        .select("status, created_at, expires_at")
+        .eq("id", callId)
+        .maybeSingle();
+
+      if (error) {
+        console.warn(
+          "Could not verify unanswered call status:",
+          error.message
+        );
+        return;
+      }
+
+      if (!data || data.status !== "ringing") {
+        return;
+      }
+
+      const expiryTime = data.expires_at
+        ? new Date(data.expires_at).getTime()
+        : new Date(data.created_at).getTime() +
+          UNANSWERED_TIMEOUT_MS;
+
+      if (Date.now() < expiryTime) {
+        return;
+      }
+
+      await finishCall("missed", reason);
+    },
+    [callId, finishCall]
+  );
+
+  const handleEndPress = useCallback(() => {
+    if (call?.status === "ringing" && isCaller) {
+      // Preserve the existing history model: a caller cancellation before
+      // answer is stored as missed, with a distinct reason for diagnostics.
+      void finishCall("missed", "cancelled_by_caller");
+      return;
+    }
+
+    void finishCall("ended", "local_hangup");
+  }, [call?.status, finishCall, isCaller]);
 
   useEffect(() => {
     if (!callId || !user) return;
@@ -624,6 +777,36 @@ export default function CallScreen() {
         if (error) throw error;
         const loadedCall = data as VoiceCall;
         if (!mounted) return;
+
+        if (isTerminalCallStatus(loadedCall.status)) {
+          cleanupMedia();
+          endNativeCall(
+            callId,
+            loadedCall.status === "missed"
+              ? CALLKIT_END_REASONS.MISSED
+              : loadedCall.status === "failed"
+                ? CALLKIT_END_REASONS.FAILED
+                : loadedCall.status === "declined"
+                  ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
+                  : CALLKIT_END_REASONS.REMOTE_ENDED,
+          );
+          closeCallScreen();
+          return;
+        }
+
+        if (loadedCall.status === "ringing") {
+          const expiryTime = loadedCall.expires_at
+            ? new Date(loadedCall.expires_at).getTime()
+            : new Date(loadedCall.created_at).getTime() +
+              UNANSWERED_TIMEOUT_MS;
+
+          if (Date.now() >= expiryTime) {
+            setCall(loadedCall);
+            await finishMissedIfStillRinging("expired_before_open");
+            return;
+          }
+        }
+
         setCall(loadedCall);
 
         const otherId =
@@ -650,7 +833,12 @@ export default function CallScreen() {
     return () => {
       mounted = false;
     };
-  }, [callId, user]);
+  }, [
+    callId,
+    cleanupMedia,
+    finishMissedIfStillRinging,
+    user,
+  ]);
 
   useEffect(() => {
     if (!call || !user || !isCaller || call.status !== "ringing") return;
@@ -694,7 +882,7 @@ export default function CallScreen() {
   }, [call?.status, callId]);
 
   useEffect(() => {
-    if (!call || call.status !== "ringing") {
+    if (!call || call.status !== "ringing" || !isCaller) {
       if (unansweredTimerRef.current) {
         clearTimeout(unansweredTimerRef.current);
         unansweredTimerRef.current = null;
@@ -714,7 +902,9 @@ export default function CallScreen() {
 
     unansweredTimerRef.current = setTimeout(
       () => {
-        void finishCall("missed", "unanswered");
+        // Re-read the row before marking missed so an answer/decline that
+        // wins the race at the timeout boundary is never overwritten.
+        void finishMissedIfStillRinging("unanswered");
       },
       remaining
     );
@@ -727,7 +917,8 @@ export default function CallScreen() {
     };
   }, [
     call,
-    finishCall,
+    finishMissedIfStillRinging,
+    isCaller,
   ]);
 
   useEffect(() => {
@@ -747,13 +938,15 @@ export default function CallScreen() {
           const updated = payload.new as VoiceCall;
           setCall(updated);
 
-          if (updated.answer && updated.caller_id === user.id) {
+          if (
+            updated.status === "accepted" &&
+            updated.answer &&
+            updated.caller_id === user.id
+          ) {
             await applyRemoteAnswer(updated.answer);
           }
 
-          if (
-            ["declined", "ended", "missed", "failed"].includes(updated.status)
-          ) {
+          if (isTerminalCallStatus(updated.status)) {
             cleanupMedia();
             endNativeCall(
               callId,
@@ -775,7 +968,7 @@ export default function CallScreen() {
             setConnectionLabel(
               labels[updated.status] ?? "Call ended"
             );
-            setTimeout(() => router.back(), 650);
+            setTimeout(() => closeCallScreen(), 650);
           }
         },
       )
@@ -839,7 +1032,7 @@ export default function CallScreen() {
               return;
             }
 
-            if (data?.answer) {
+            if (data?.status === "accepted" && data?.answer) {
               void applyRemoteAnswer(data.answer as Record<string, unknown>);
             }
           });
@@ -1378,12 +1571,7 @@ export default function CallScreen() {
             </Pressable>
 
             <Pressable
-              onPress={() =>
-                void finishCall(
-                  "ended",
-                  "local_hangup"
-                )
-              }
+              onPress={handleEndPress}
               style={[
                 styles.controlButton,
                 styles.hangupButton,

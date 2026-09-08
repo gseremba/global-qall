@@ -1,5 +1,6 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { useEffect, useMemo, useState } from "react";
+import { useAudioPlayer } from "expo-audio";
 import { router, useLocalSearchParams } from "expo-router";
 import {
   Alert,
@@ -28,13 +29,43 @@ const KEYS = [
   "#",
 ];
 
+const DTMF_SOURCES: Record<string, number> = {
+  "1": require("../../assets/sounds/1.wav"),
+  "2": require("../../assets/sounds/2.wav"),
+  "3": require("../../assets/sounds/3.wav"),
+  "4": require("../../assets/sounds/4.wav"),
+  "5": require("../../assets/sounds/5.wav"),
+  "6": require("../../assets/sounds/6.wav"),
+  "7": require("../../assets/sounds/7.wav"),
+  "8": require("../../assets/sounds/8.wav"),
+  "9": require("../../assets/sounds/9.wav"),
+  "0": require("../../assets/sounds/0.wav"),
+  "*": require("../../assets/sounds/star.wav"),
+  "#": require("../../assets/sounds/pound.wav"),
+};
+
 function formatQallId(value: string): string {
   const groups = value.match(/.{1,3}/g);
   return groups?.join("-") ?? value;
 }
 
 export default function QallScreen() {
+  const params = useLocalSearchParams<{
+    qallId?: string | string[];
+    selectionKey?: string | string[];
+  }>();
+
+  const incomingQallId = Array.isArray(params.qallId)
+    ? params.qallId[0]
+    : params.qallId;
+
+  const incomingSelectionKey = Array.isArray(params.selectionKey)
+    ? params.selectionKey[0]
+    : params.selectionKey;
+
+
   const [digits, setDigits] = useState("");
+  const keypadPlayer = useAudioPlayer(null);
 
   useEffect(() => {
     if (!incomingQallId) {
@@ -45,23 +76,36 @@ export default function QallScreen() {
       .replace(/\D/g, "")
       .slice(0, 12);
 
+    // Always replace the previous dialer value when a contact button
+    // opens this already-mounted tab. selectionKey changes on every press,
+    // even if Expo Router reuses the same /qall screen instance.
     setDigits(incomingDigits);
-  }, [incomingQallId]);
+  }, [incomingQallId, incomingSelectionKey]);
 
   const formattedId = useMemo(
     () => formatQallId(digits),
     [digits]
   );
 
-  const params = useLocalSearchParams<{
-    qallId?: string | string[];
-  }>();
 
-  const incomingQallId = Array.isArray(params.qallId)
-    ? params.qallId[0]
-    : params.qallId;
+
+  function playKeyTone(value: string) {
+    const source = DTMF_SOURCES[value];
+    if (!source) return;
+
+    try {
+      keypadPlayer.replace(source);
+      keypadPlayer.volume = 0.55;
+      keypadPlayer.play();
+    } catch (error) {
+      console.warn("Could not play keypad tone:", error);
+    }
+  }
 
   function addDigit(value: string) {
+    // Always give immediate keypad feedback, even if the Qall ID is full.
+    playKeyTone(value);
+
     if (digits.length >= 12) {
       return;
     }

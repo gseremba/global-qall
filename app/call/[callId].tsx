@@ -1,6 +1,8 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { setAudioModeAsync } from "expo-audio";
+import * as Network from "expo-network";
+import { setAudioModeAsync, useAudioPlayer
+} from "expo-audio";
 import InCallManager from "react-native-incall-manager";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -42,32 +44,126 @@ import {
 } from "../../lib/callkit";
 import { supabase } from "../../lib/supabase";
 
-const TURN_URL = process.env.EXPO_PUBLIC_TURN_URL;
-const TURN_USERNAME =
-  process.env.EXPO_PUBLIC_TURN_USERNAME;
-const TURN_CREDENTIAL =
-  process.env.EXPO_PUBLIC_TURN_CREDENTIAL;
+const VOIP_SERVER_URL = (
+  process.env.EXPO_PUBLIC_VOIP_SERVER_URL ||
+  "https://globalqall-voip.onrender.com"
+).replace(/\/+$/, "");
 
-const RTC_CONFIGURATION = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    ...(TURN_URL &&
-    TURN_USERNAME &&
-    TURN_CREDENTIAL
-      ? [
-          {
-            urls: TURN_URL,
-            username: TURN_USERNAME,
-            credential: TURN_CREDENTIAL,
-          },
-        ]
-      : []),
-  ],
+const FALLBACK_ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+type IceServerConfig = {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
 };
 
+let cachedIceServers: IceServerConfig[] | null = null;
+let cachedIceServersExpiresAt = 0;
+
+async function loadIceServers(): Promise<IceServerConfig[]> {
+  const now = Date.now();
+
+  if (
+    cachedIceServers &&
+    cachedIceServersExpiresAt > now
+  ) {
+    return cachedIceServers;
+  }
+
+  try {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+
+    if (!session?.access_token) {
+      throw new Error("No authenticated session for TURN request");
+    }
+
+    const response = await fetch(
+      `${VOIP_SERVER_URL}/api/turn-credentials`,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${session.access_token}`,
+          accept: "application/json",
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `TURN endpoint returned ${response.status}`
+      );
+    }
+
+    const payload = await response.json();
+    const remoteIceServers = Array.isArray(payload?.iceServers)
+      ? (payload.iceServers as IceServerConfig[])
+      : [];
+
+    if (remoteIceServers.length === 0) {
+      throw new Error("TURN endpoint returned no ICE servers");
+    }
+
+    const ttlSeconds = Number(payload?.ttl || 3600);
+
+    cachedIceServers = [
+      ...FALLBACK_ICE_SERVERS,
+      ...remoteIceServers,
+    ];
+
+    // Refresh credentials before the one-hour token expires.
+    cachedIceServersExpiresAt =
+      now + Math.max(60, ttlSeconds - 600) * 1000;
+
+    console.log("[TURN]", {
+      event: "ice_servers_loaded",
+      serverCount: cachedIceServers.length,
+      relayServerCount: remoteIceServers.filter((server) => {
+        const urls = Array.isArray(server.urls)
+          ? server.urls
+          : [server.urls];
+
+        return urls.some((url) =>
+          String(url).startsWith("turn:")
+        );
+      }).length,
+      ttlSeconds,
+      timestamp: new Date().toISOString(),
+    });
+
+    return cachedIceServers;
+  } catch (error) {
+    console.warn("[TURN]", {
+      event: "ice_servers_fallback_stun_only",
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+      timestamp: new Date().toISOString(),
+    });
+
+    return FALLBACK_ICE_SERVERS;
+  }
+}
+
 const UNANSWERED_TIMEOUT_MS = 35_000;
+const INITIAL_CONNECT_TIMEOUT_MS = 25_000;
 const RECONNECT_GRACE_MS = 12_000;
+const ICE_RESTART_COOLDOWN_MS = 6_000;
+const JS_HEARTBEAT_INTERVAL_MS = 5_000;
+const JS_SUSPENSION_GAP_MS = 12_000;
+const POST_SUSPENSION_VERIFY_MS = 1_200;
+const BACKGROUND_NETWORK_VERIFY_MS = 1_500;
+
+// Sprint 10.2D.3: accepted-call liveness is intentionally much slower
+// than ICE/TURN recovery. Media recovery gets the first chance to succeed.
+const PEER_LIVENESS_SAMPLE_MS = 10_000;
+const PEER_LIVENESS_WRITE_MIN_MS = 20_000;
+const STALE_ACCEPTED_CHECK_MS = 30_000;
 const TERMINAL_CALL_STATUSES = new Set([
   "declined",
   "ended",
@@ -79,12 +175,51 @@ function isTerminalCallStatus(status: string): boolean {
   return TERMINAL_CALL_STATUSES.has(status);
 }
 
+function terminalCallLabel(
+  status: string,
+  endReason?: string | null
+): string {
+  if (status === "declined") {
+    return "Call declined";
+  }
+
+  if (status === "missed") {
+    return "No answer";
+  }
+
+  if (status === "failed") {
+    if (endReason === "unreachable") {
+      return "User unavailable";
+    }
+
+    if (endReason === "connecting_timeout") {
+      return "Unable to connect";
+    }
+
+    if (endReason === "connection_lost") {
+      return "Connection lost";
+    }
+
+    if (endReason === "busy") {
+      return "User is busy";
+    }
+
+    return "Call failed";
+  }
+
+  if (status === "ended") {
+    return "Call ended";
+  }
+
+  return "Call ended";
+}
+
 
 function closeCallScreen() {
   if (router.canGoBack()) {
     router.back();
   } else {
-    router.replace("/chat");
+    router.replace("/chats");
   }
 }
 
@@ -114,6 +249,7 @@ export default function CallScreen() {
   const [loading, setLoading] = useState(true);
   const [preparing, setPreparing] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [holdUpdating, setHoldUpdating] = useState(false);
   const [speakerOn, setSpeakerOn] = useState(false);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [frontCamera, setFrontCamera] = useState(true);
@@ -124,12 +260,20 @@ export default function CallScreen() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [connectionLabel, setConnectionLabel] =
     useState("Preparing call…");
+  const [peerConnectionState, setPeerConnectionState] =
+    useState("new");
+  const [iceConnectionState, setIceConnectionState] =
+    useState("new");
   const [networkQuality, setNetworkQuality] =
     useState<"Excellent" | "Good" | "Poor" | "Unknown">(
       "Unknown"
     );
   const [remoteVideoAvailable, setRemoteVideoAvailable] =
     useState(false);
+  const ringbackPlayer = useAudioPlayer(
+    require("../../assets/sounds/outgoing-ringback.wav"),
+    { keepAudioSessionActive: true }
+  );
   const { width, height } = useWindowDimensions();
   const isLandscape = width > height;
   const previewPosition = useRef(
@@ -137,24 +281,141 @@ export default function CallScreen() {
   ).current;
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
+  const reconnectTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const callChannelRef = useRef<any>(null);
   const remoteDescriptionReadyRef = useRef(false);
   const pendingCandidatesRef = useRef<Record<string, unknown>[]>([]);
   const offerCreatedRef = useRef(false);
   const answerAppliedRef = useRef(false);
   const answerApplyingRef = useRef(false);
+  const iceRestartInProgressRef = useRef(false);
+  const iceRestartAttemptRef = useRef(0);
+  const lastIceRestartStartedAtRef = useRef(0);
+  const lastHandledRestartOfferSdpRef = useRef<string | null>(null);
+  const lastAnsweredRestartOfferSdpRef = useRef<string | null>(null);
+  const callStatusRef = useRef<VoiceCall["status"] | null>(null);
+  const lastNetworkTypeRef = useRef<string | null>(null);
+  const lastNetworkConnectedRef = useRef<boolean | null>(null);
+  const lastNetworkReachableRef = useRef<boolean | null>(null);
+  const lastNetworkRecoveryAtRef = useRef(0);
+  const lifecycleStateRef = useRef(AppState.currentState);
+  const backgroundedAtRef = useRef<number | null>(null);
+  const backgroundNetworkSnapshotRef = useRef<{
+    type: string | null;
+    isConnected: boolean | null;
+    isInternetReachable: boolean | null;
+  } | null>(null);
+  const backgroundNetworkVerifyTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+  const lifecycleSummaryRef = useRef({
+    backgroundCount: 0,
+    resumeCount: 0,
+    totalBackgroundMs: 0,
+    longestBackgroundMs: 0,
+    jsSuspensionCount: 0,
+    backgroundNetworkChangeCount: 0,
+    recoveryRequiredCount: 0,
+    recoverySucceededCount: 0,
+    unlockAudioRestoreCount: 0,
+    firstBackgroundAt: null as string | null,
+    lastResumeAt: null as string | null,
+    lastNetworkFrom: null as string | null,
+    lastNetworkTo: null as string | null,
+  });
+  const lifecycleSummaryWrittenRef = useRef(false);
+  const lifecycleAudioRestoreTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+  const lastJsHeartbeatAtRef = useRef(Date.now());
+  const postSuspensionVerifyTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+  const requestIceRestartRef = useRef<(() => void) | null>(null);
+  const activeIceServersRef = useRef<IceServerConfig[]>([]);
+  const speakerOnRef = useRef(false);
+  const cameraEnabledRef = useRef(true);
+  const audioRecoveryTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+  const needsAudioRecoveryRef = useRef(false);
   const nativeAnswerAppliedRef = useRef(false);
+  const acceptInFlightRef = useRef(false);
   const nativeOutgoingStartedRef = useRef(false);
   const nativeConnectedRef = useRef(false);
   const endedLocallyRef = useRef(false);
   const appliedCandidateKeysRef = useRef(new Set<string>());
-  const reconnectTimerRef = useRef<
-    ReturnType<typeof setTimeout> | null
-  >(null);
+  const seenRemoteIceUfragsRef = useRef(
+    new Set<string>()
+  );
   const unansweredTimerRef = useRef<
     ReturnType<typeof setTimeout> | null
   >(null);
+  const initialConnectTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+  const hasEverConnectedRef = useRef(false);
+  const lastInboundPacketsRef = useRef(-1);
+  const lastPeerLivenessWriteAtRef = useRef(0);
+  const lastStaleAcceptedCheckAtRef = useRef(0);
+  const lastQualitySnapshotRef = useRef<Record<string, unknown> | null>(
+    null
+  );
+  const connectedDiagnosticWrittenRef = useRef(false);
+  const terminalNavigationTimerRef = useRef<
+    ReturnType<typeof setTimeout> | null
+  >(null);
+
+  const recordCallDiagnostic = useCallback(
+    async (
+      eventName: string,
+      severity: "info" | "warning" | "error" = "info",
+      details: Record<string, unknown> = {}
+    ) => {
+      if (!callId || !user?.id) {
+        return;
+      }
+
+      try {
+        const { error } = await supabase.rpc(
+          "record_call_diagnostic",
+          {
+            requested_call_id: callId,
+            requested_event: eventName,
+            requested_severity: severity,
+            requested_details: details,
+          }
+        );
+
+        if (error) {
+          console.warn("[CALL DIAGNOSTICS]", {
+            callId,
+            event: "persist_failed",
+            diagnosticEvent: eventName,
+            error: error.message,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      } catch (error) {
+        // Diagnostics must never affect the call itself.
+        console.warn("[CALL DIAGNOSTICS]", {
+          callId,
+          event: "persist_failed",
+          diagnosticEvent: eventName,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+          timestamp: new Date().toISOString(),
+        });
+      }
+    },
+    [callId, user?.id]
+  );
 
   const previewPanResponder = useRef(
     PanResponder.create({
@@ -188,22 +449,29 @@ export default function CallScreen() {
     call && user && call.callee_id === user.id
   );
   const isVideoCall = call?.call_type === "video";
+  const localOnHold = Boolean(
+    call && isCaller ? call.caller_on_hold : call?.callee_on_hold
+  );
+  const remoteOnHold = Boolean(
+    call && isCaller ? call.callee_on_hold : call?.caller_on_hold
+  );
 
   const cleanupMedia = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-
     if (unansweredTimerRef.current) {
       clearTimeout(unansweredTimerRef.current);
       unansweredTimerRef.current = null;
+    }
+
+    if (initialConnectTimerRef.current) {
+      clearTimeout(initialConnectTimerRef.current);
+      initialConnectTimerRef.current = null;
     }
 
     localStreamRef.current
       ?.getTracks()
       .forEach((track) => track.stop());
     localStreamRef.current = null;
+    remoteStreamRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
     setRemoteVideoAvailable(false);
@@ -214,6 +482,81 @@ export default function CallScreen() {
     InCallManager.stop();
     InCallManager.setForceSpeakerphoneOn(false);
   }, []);
+
+  const extractIceUfragFromSdp = useCallback(
+    (sdp: string | null | undefined) => {
+      if (!sdp) return null;
+      const match = sdp.match(/^a=ice-ufrag:(.+)$/m);
+      return match?.[1]?.trim() || null;
+    },
+    [],
+  );
+
+  const extractCandidateIceUfrag = useCallback(
+    (candidate: Record<string, unknown>) => {
+      const explicit =
+        typeof candidate.usernameFragment === "string"
+          ? candidate.usernameFragment
+          : typeof candidate.ufrag === "string"
+            ? candidate.ufrag
+            : null;
+
+      if (explicit) return explicit;
+
+      const candidateLine =
+        typeof candidate.candidate === "string"
+          ? candidate.candidate
+          : "";
+
+      const match = candidateLine.match(
+        /\bufrag\s+([^\s]+)/i,
+      );
+
+      return match?.[1] || null;
+    },
+    [],
+  );
+
+  const classifyRemoteCandidateGeneration =
+    useCallback(
+      (
+        candidate: Record<string, unknown>
+      ): "current" | "future" | "stale" => {
+        const peer = peerRef.current;
+
+        if (!peer?.remoteDescription?.sdp) {
+          return "future";
+        }
+
+        const expectedUfrag = extractIceUfragFromSdp(
+          peer.remoteDescription.sdp,
+        );
+        const candidateUfrag =
+          extractCandidateIceUfrag(candidate);
+
+        if (!expectedUfrag || !candidateUfrag) {
+          return "current";
+        }
+
+        if (expectedUfrag === candidateUfrag) {
+          return "current";
+        }
+
+        if (
+          seenRemoteIceUfragsRef.current.has(
+            candidateUfrag
+          )
+        ) {
+          return "stale";
+        }
+
+        return "future";
+      },
+      [
+        extractCandidateIceUfrag,
+        extractIceUfragFromSdp,
+      ],
+    );
 
   const candidateKey = useCallback(
     (candidate: Record<string, unknown>) => JSON.stringify(candidate),
@@ -238,6 +581,47 @@ export default function CallScreen() {
         return;
       }
 
+      const generation =
+        classifyRemoteCandidateGeneration(candidate);
+
+      if (generation === "future") {
+        const alreadyQueued =
+          pendingCandidatesRef.current.some(
+            (queuedCandidate) =>
+              candidateKey(queuedCandidate) === key
+          );
+
+        if (!alreadyQueued) {
+          pendingCandidatesRef.current.push(candidate);
+        }
+
+        console.log("[ICE GENERATION]", {
+          callId,
+          event: "future_candidate_queued",
+          expectedUfrag: extractIceUfragFromSdp(
+            peerRef.current.remoteDescription?.sdp
+          ),
+          candidateUfrag:
+            extractCandidateIceUfrag(candidate),
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (generation === "stale") {
+        console.log("[ICE GENERATION]", {
+          callId,
+          event: "stale_candidate_ignored",
+          expectedUfrag: extractIceUfragFromSdp(
+            peerRef.current.remoteDescription?.sdp
+          ),
+          candidateUfrag:
+            extractCandidateIceUfrag(candidate),
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
       try {
         await peerRef.current.addIceCandidate(new RTCIceCandidate(candidate));
         appliedCandidateKeysRef.current.add(key);
@@ -245,7 +629,13 @@ export default function CallScreen() {
         console.warn("Could not add remote ICE candidate:", error);
       }
     },
-    [candidateKey],
+    [
+      callId,
+      candidateKey,
+      classifyRemoteCandidateGeneration,
+      extractCandidateIceUfrag,
+      extractIceUfragFromSdp,
+    ],
   );
 
   const flushCandidates = useCallback(async () => {
@@ -259,7 +649,22 @@ export default function CallScreen() {
     for (const candidate of queued) {
       await addRemoteCandidate(candidate);
     }
-  }, [addRemoteCandidate]);
+
+    console.log("[ICE GENERATION]", {
+      callId,
+      event: "candidate_queue_flushed",
+      attempted: queued.length,
+      remaining: pendingCandidatesRef.current.length,
+      currentUfrag: extractIceUfragFromSdp(
+        peerRef.current.remoteDescription?.sdp
+      ),
+      timestamp: new Date().toISOString(),
+    });
+  }, [
+    addRemoteCandidate,
+    callId,
+    extractIceUfragFromSdp,
+  ]);
 
   const syncRemoteCandidates = useCallback(async () => {
     if (!callId || !user) {
@@ -300,7 +705,7 @@ export default function CallScreen() {
       // "have-local-offer". Realtime plus recovery polling can deliver the
       // same answer more than once, so ignore it after the peer becomes stable.
       if (peer.signalingState !== "have-local-offer") {
-        if (peer.signalingState === "stable") {
+        if ((peer.signalingState as string) === "stable") {
           answerAppliedRef.current = true;
         }
         return;
@@ -309,18 +714,63 @@ export default function CallScreen() {
       answerApplyingRef.current = true;
 
       try {
+        const previousRemoteUfrag =
+          extractIceUfragFromSdp(
+            peer.remoteDescription?.sdp,
+          );
+
         await peer.setRemoteDescription(
-          new RTCSessionDescription(answer),
+          new RTCSessionDescription(answer as any),
         );
+
+        const nextRemoteUfrag =
+          extractIceUfragFromSdp(
+            peer.remoteDescription?.sdp,
+          );
+
+        if (
+          previousRemoteUfrag &&
+          nextRemoteUfrag &&
+          previousRemoteUfrag !== nextRemoteUfrag
+        ) {
+          seenRemoteIceUfragsRef.current.add(
+            previousRemoteUfrag
+          );
+          seenRemoteIceUfragsRef.current.add(
+            nextRemoteUfrag
+          );
+          appliedCandidateKeysRef.current.clear();
+    seenRemoteIceUfragsRef.current.clear();
+
+          console.log("[ICE GENERATION]", {
+            callId,
+            event: "remote_generation_changed",
+            previousUfrag: previousRemoteUfrag,
+            nextUfrag: nextRemoteUfrag,
+            side: "caller",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        if (nextRemoteUfrag) {
+          seenRemoteIceUfragsRef.current.add(
+            nextRemoteUfrag
+          );
+        }
+
         answerAppliedRef.current = true;
         remoteDescriptionReadyRef.current = true;
         await flushCandidates();
         await syncRemoteCandidates();
-        setConnectionLabel("Connecting…");
+
+        // The remote SDP answer has been applied successfully and the call
+        // is already accepted in Supabase. Do not keep the caller UI stuck
+        // on “Connecting…” while waiting for a delayed WebRTC callback.
+        setConnectionLabel("Connected");
       } catch (error) {
         // Another answer handler may have completed while this async call was
         // waiting. A stable peer already has its remote answer, so this is safe.
-        if (peer.signalingState === "stable") {
+        if ((peer.signalingState as string) === "stable") {
           answerAppliedRef.current = true;
           return;
         }
@@ -330,7 +780,327 @@ export default function CallScreen() {
         answerApplyingRef.current = false;
       }
     },
-    [flushCandidates, syncRemoteCandidates],
+    [
+      extractIceUfragFromSdp,
+      flushCandidates,
+      syncRemoteCandidates,
+    ],
+  );
+
+  const handleRemoteIceRestartOffer = useCallback(
+    async (offer: Record<string, unknown> | null) => {
+      if (!offer || !callId || !user || isCaller) {
+        return;
+      }
+
+      const peer = peerRef.current;
+      if (!peer) {
+        return;
+      }
+
+      const offerSdp =
+        typeof offer.sdp === "string" ? offer.sdp : null;
+
+      if (!offerSdp) {
+        return;
+      }
+
+      if (
+        offerSdp === lastHandledRestartOfferSdpRef.current ||
+        offerSdp === lastAnsweredRestartOfferSdpRef.current ||
+        offerSdp === peer.remoteDescription?.sdp
+      ) {
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "restart_offer_ignored_duplicate",
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      try {
+        // Mark before awaiting anything so realtime/polling cannot process
+        // the same SDP concurrently.
+        lastHandledRestartOfferSdpRef.current = offerSdp;
+
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "restart_offer_received",
+          timestamp: new Date().toISOString(),
+        });
+
+        setConnectionLabel("Reconnecting…");
+
+        const recoveryIceServers = await loadIceServers();
+        activeIceServersRef.current = recoveryIceServers;
+
+        const relayServerCount = recoveryIceServers.filter((server) => {
+          const urls = Array.isArray(server.urls)
+            ? server.urls
+            : [server.urls];
+          return urls.some((url) =>
+            String(url).startsWith("turn:") ||
+            String(url).startsWith("turns:")
+          );
+        }).length;
+
+        console.log("[TURN RECOVERY]", {
+          callId,
+          event: "relay_policy_requested",
+          reason: "callee_restart",
+          iceServerCount: recoveryIceServers.length,
+          relayServerCount,
+          timestamp: new Date().toISOString(),
+        });
+
+        try {
+          const setConfiguration = (peer as any).setConfiguration;
+          if (relayServerCount > 0 && typeof setConfiguration === "function") {
+            setConfiguration.call(peer, {
+              iceServers: recoveryIceServers,
+              iceTransportPolicy: "relay",
+            });
+            console.log("[TURN RECOVERY]", {
+              callId,
+              event: "relay_policy_applied",
+              reason: "callee_restart",
+              relayServerCount,
+              timestamp: new Date().toISOString(),
+            });
+          } else {
+            console.warn("[TURN RECOVERY]", {
+              callId,
+              event: relayServerCount === 0
+                ? "relay_policy_unavailable_no_turn_servers"
+                : "set_configuration_unavailable",
+              reason: "callee_restart",
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (error) {
+          console.warn("[TURN RECOVERY]", {
+            callId,
+            event: "relay_policy_apply_failed",
+            reason: "callee_restart",
+            error: error instanceof Error ? error.message : String(error),
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const previousRemoteUfrag =
+          extractIceUfragFromSdp(
+            peer.remoteDescription?.sdp,
+          );
+
+        await peer.setRemoteDescription(
+          new RTCSessionDescription(offer as any),
+        );
+
+        const nextRemoteUfrag =
+          extractIceUfragFromSdp(
+            peer.remoteDescription?.sdp,
+          );
+
+        if (
+          previousRemoteUfrag &&
+          nextRemoteUfrag &&
+          previousRemoteUfrag !== nextRemoteUfrag
+        ) {
+          seenRemoteIceUfragsRef.current.add(
+            previousRemoteUfrag
+          );
+          seenRemoteIceUfragsRef.current.add(
+            nextRemoteUfrag
+          );
+          appliedCandidateKeysRef.current.clear();
+
+          console.log("[ICE GENERATION]", {
+            callId,
+            event: "remote_generation_changed",
+            previousUfrag: previousRemoteUfrag,
+            nextUfrag: nextRemoteUfrag,
+            side: "callee",
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        if (nextRemoteUfrag) {
+          seenRemoteIceUfragsRef.current.add(
+            nextRemoteUfrag
+          );
+        }
+
+        remoteDescriptionReadyRef.current = true;
+        await flushCandidates();
+        await syncRemoteCandidates();
+        await flushCandidates();
+
+        if (offerSdp === lastAnsweredRestartOfferSdpRef.current) {
+          console.log("[WEBRTC RECOVERY]", {
+            callId,
+            event: "restart_answer_skipped_duplicate",
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+
+        const { data, error } = await supabase
+          .from("calls")
+          .update({
+            answer: answer.toJSON ? answer.toJSON() : answer,
+          })
+          .eq("id", callId)
+          .eq("status", "accepted")
+          .select("id")
+          .maybeSingle();
+
+        if (error) {
+          throw error;
+        }
+
+        if (!data) {
+          console.warn("[WEBRTC RECOVERY]", {
+            callId,
+            event: "restart_answer_not_saved",
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        lastAnsweredRestartOfferSdpRef.current = offerSdp;
+
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "restart_answer_saved",
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        if (
+          lastAnsweredRestartOfferSdpRef.current !== offerSdp &&
+          lastHandledRestartOfferSdpRef.current === offerSdp
+        ) {
+          lastHandledRestartOfferSdpRef.current = null;
+        }
+
+        console.warn("[WEBRTC RECOVERY]", {
+          callId,
+          event: "restart_offer_failed",
+          error:
+            error instanceof Error ? error.message : String(error),
+          timestamp: new Date().toISOString(),
+        });
+        setConnectionLabel("Connection issue");
+      }
+    },
+    [
+      callId,
+      extractIceUfragFromSdp,
+      flushCandidates,
+      isCaller,
+      syncRemoteCandidates,
+      user,
+      recordCallDiagnostic,
+    ],
+  );
+
+  const logSelectedIcePath = useCallback(
+    async (peer: RTCPeerConnection) => {
+      try {
+        if (
+          peer.connectionState === "closed" ||
+          isTerminalCallStatus(callStatusRef.current ?? "")
+        ) {
+          return;
+        }
+
+        const stats: any = await peer.getStats();
+        const reports: any[] = [];
+
+        if (typeof stats?.forEach === "function") {
+          stats.forEach((report: any) => reports.push(report));
+        } else if (Array.isArray(stats)) {
+          reports.push(...stats);
+        }
+
+        const byId = new Map<string, any>();
+        for (const report of reports) {
+          if (report?.id) {
+            byId.set(report.id, report);
+          }
+        }
+
+        let selectedPair: any = reports.find(
+          (report) =>
+            report?.type === "candidate-pair" &&
+            report?.selected === true
+        );
+
+        if (!selectedPair) {
+          const transport = reports.find(
+            (report) =>
+              report?.type === "transport" &&
+              report?.selectedCandidatePairId
+          );
+
+          if (transport?.selectedCandidatePairId) {
+            selectedPair = byId.get(
+              transport.selectedCandidatePairId
+            );
+          }
+        }
+
+        if (!selectedPair) {
+          selectedPair = reports.find(
+            (report) =>
+              report?.type === "candidate-pair" &&
+              (report?.state === "succeeded" ||
+                report?.nominated === true)
+          );
+        }
+
+        const localCandidate = selectedPair?.localCandidateId
+          ? byId.get(selectedPair.localCandidateId)
+          : null;
+        const remoteCandidate = selectedPair?.remoteCandidateId
+          ? byId.get(selectedPair.remoteCandidateId)
+          : null;
+
+        console.log("[ICE PATH]", {
+          callId,
+          localCandidateType:
+            localCandidate?.candidateType ?? null,
+          localProtocol:
+            localCandidate?.protocol ?? null,
+          remoteCandidateType:
+            remoteCandidate?.candidateType ?? null,
+          remoteProtocol:
+            remoteCandidate?.protocol ?? null,
+          usingRelay:
+            localCandidate?.candidateType === "relay" ||
+            remoteCandidate?.candidateType === "relay",
+          transportPolicy: "production-fallback",
+          bytesSent: selectedPair?.bytesSent ?? null,
+          bytesReceived: selectedPair?.bytesReceived ?? null,
+          currentRoundTripTime:
+            selectedPair?.currentRoundTripTime ?? null,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.warn("[ICE PATH]", {
+          callId,
+          event: "stats_unavailable",
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+          timestamp: new Date().toISOString(),
+        });
+      }
+    },
+    [callId]
   );
 
   const preparePeer = useCallback(async () => {
@@ -351,7 +1121,12 @@ export default function CallScreen() {
       auto: true,
     });
     InCallManager.setKeepScreenOn(true);
-    InCallManager.setForceSpeakerphoneOn(false);
+
+    // Professional route defaults: voice calls begin on the earpiece, while
+    // video calls begin on speaker. Keep the UI state aligned with the route.
+    const defaultSpeakerOn = call?.call_type === "video";
+    InCallManager.setForceSpeakerphoneOn(defaultSpeakerOn);
+    setSpeakerOn(defaultSpeakerOn);
 
     const stream = await mediaDevices.getUserMedia({
       audio: true,
@@ -368,19 +1143,62 @@ export default function CallScreen() {
     localStreamRef.current = stream;
     setLocalStream(stream);
 
-    const peer = new RTCPeerConnection(RTC_CONFIGURATION);
+    const iceServers = await loadIceServers();
+    activeIceServersRef.current = iceServers;
+
+    const relayServerCount = iceServers.filter((server) => {
+      const urls = Array.isArray(server.urls)
+        ? server.urls
+        : [server.urls];
+
+      return urls.some((url) =>
+        String(url).startsWith("turn:") ||
+        String(url).startsWith("turns:")
+      );
+    }).length;
+
+    console.log("[TURN]", {
+      callId,
+      event: "startup_ice_policy",
+      policy: "all",
+      iceServerCount: iceServers.length,
+      relayServerCount,
+      timestamp: new Date().toISOString(),
+    });
+
+    const peer = new RTCPeerConnection({
+      iceServers,
+      iceTransportPolicy: "all",
+    } as any);
     stream.getTracks().forEach((track) => peer.addTrack(track, stream));
 
     peer.onicecandidate = (event: any) => {
       if (!event.candidate) return;
+
+      const serializedCandidate =
+        event.candidate.toJSON
+          ? event.candidate.toJSON()
+          : event.candidate;
+
+      console.log("[ICE GENERATION]", {
+        callId,
+        event: "local_candidate",
+        ufrag: extractCandidateIceUfrag(
+          serializedCandidate as Record<string, unknown>
+        ),
+        type:
+          (serializedCandidate as any)?.type ?? null,
+        protocol:
+          (serializedCandidate as any)?.protocol ?? null,
+        timestamp: new Date().toISOString(),
+      });
+
       void supabase
         .from("call_ice_candidates")
         .insert({
           call_id: callId,
           user_id: user.id,
-          candidate: event.candidate.toJSON
-            ? event.candidate.toJSON()
-            : event.candidate,
+          candidate: serializedCandidate,
         })
         .then(({ error }) => {
           if (error) {
@@ -389,70 +1207,518 @@ export default function CallScreen() {
         });
     };
 
-    const clearReconnectTimer = () => {
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
+    const forceRelayPolicy = async (
+      reason: "caller_restart" | "callee_restart"
+    ) => {
+      const servers = activeIceServersRef.current;
+      const relayServerCount = servers.filter((server) => {
+        const urls = Array.isArray(server.urls)
+          ? server.urls
+          : [server.urls];
+        return urls.some((url) =>
+          String(url).startsWith("turn:") ||
+          String(url).startsWith("turns:")
+        );
+      }).length;
+
+      console.log("[TURN RECOVERY]", {
+        callId,
+        event: "relay_policy_requested",
+        reason,
+        iceServerCount: servers.length,
+        relayServerCount,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (relayServerCount === 0) {
+        console.warn("[TURN RECOVERY]", {
+          callId,
+          event: "relay_policy_unavailable_no_turn_servers",
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+        return false;
+      }
+
+      try {
+        const setConfiguration = (peer as any).setConfiguration;
+        if (typeof setConfiguration !== "function") {
+          console.warn("[TURN RECOVERY]", {
+            callId,
+            event: "set_configuration_unavailable",
+            reason,
+            timestamp: new Date().toISOString(),
+          });
+          return false;
+        }
+
+        setConfiguration.call(peer, {
+          iceServers: servers,
+          iceTransportPolicy: "relay",
+        });
+
+        console.log("[TURN RECOVERY]", {
+          callId,
+          event: "relay_policy_applied",
+          reason,
+          relayServerCount,
+          timestamp: new Date().toISOString(),
+        });
+
+        void recordCallDiagnostic(
+          "turn_relay_forced",
+          "warning",
+          {
+            reason,
+            relayServerCount,
+            peerConnectionState: peer.connectionState,
+            iceConnectionState: peer.iceConnectionState,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+          }
+        );
+
+        return true;
+      } catch (error) {
+        console.warn("[TURN RECOVERY]", {
+          callId,
+          event: "relay_policy_apply_failed",
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+          timestamp: new Date().toISOString(),
+        });
+        return false;
       }
     };
 
-    const beginReconnectGrace = () => {
-      setConnectionLabel("Reconnecting…");
-
-      if (reconnectTimerRef.current) {
+    const attemptIceRestart = async () => {
+      if (
+        !isCaller ||
+        iceRestartInProgressRef.current ||
+        peer.connectionState === "closed"
+      ) {
         return;
       }
 
+      const now = Date.now();
+      const sinceLastRestart =
+        now - lastIceRestartStartedAtRef.current;
+
+      if (
+        lastIceRestartStartedAtRef.current > 0 &&
+        sinceLastRestart < ICE_RESTART_COOLDOWN_MS
+      ) {
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "ice_restart_cooldown_ignored",
+          remainingMs:
+            ICE_RESTART_COOLDOWN_MS - sinceLastRestart,
+          peerConnectionState: peer.connectionState,
+          iceConnectionState: peer.iceConnectionState,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      lastIceRestartStartedAtRef.current = now;
+      iceRestartInProgressRef.current = true;
+      iceRestartAttemptRef.current += 1;
+      const attempt = iceRestartAttemptRef.current;
+
+      try {
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "ice_restart_started",
+          attempt,
+          peerConnectionState: peer.connectionState,
+          iceConnectionState: peer.iceConnectionState,
+          timestamp: new Date().toISOString(),
+        });
+
+        void recordCallDiagnostic(
+          "ice_restart_started",
+          "warning",
+          {
+            attempt,
+            peerConnectionState: peer.connectionState,
+            iceConnectionState: peer.iceConnectionState,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+          }
+        );
+
+        setConnectionLabel("Reconnecting…");
+
+        await forceRelayPolicy("caller_restart");
+
+        // A new remote answer must be accepted for this restart negotiation.
+        answerAppliedRef.current = false;
+        answerApplyingRef.current = false;
+
+        const restartOffer = await peer.createOffer({
+          iceRestart: true,
+          offerToReceiveAudio: true,
+          offerToReceiveVideo:
+            call?.call_type === "video",
+        });
+
+        await peer.setLocalDescription(restartOffer);
+
+        const serializedOffer = restartOffer.toJSON
+          ? restartOffer.toJSON()
+          : restartOffer;
+
+        const { data, error } = await supabase
+          .from("calls")
+          .update({
+            offer: serializedOffer,
+            answer: null,
+          })
+          .eq("id", callId)
+          .eq("status", "accepted")
+          .select("id")
+          .maybeSingle();
+
+        if (error) {
+          throw error;
+        }
+
+        if (!data) {
+          console.warn("[WEBRTC RECOVERY]", {
+            callId,
+            event: "ice_restart_aborted_call_not_active",
+            attempt,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "ice_restart_offer_saved",
+          attempt,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.warn("[WEBRTC RECOVERY]", {
+          callId,
+          event: "ice_restart_failed",
+          attempt,
+          error:
+            error instanceof Error ? error.message : String(error),
+          timestamp: new Date().toISOString(),
+        });
+
+        void recordCallDiagnostic(
+          "ice_restart_failed",
+          "error",
+          {
+            attempt,
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error),
+            peerConnectionState: peer.connectionState,
+            iceConnectionState: peer.iceConnectionState,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+          }
+        );
+
+        setConnectionLabel("Connection issue");
+      } finally {
+        iceRestartInProgressRef.current = false;
+      }
+    };
+
+    requestIceRestartRef.current = () => {
+      void attemptIceRestart();
+    };
+
+    const clearReconnectGraceTimer = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+        console.log("[WEBRTC RECOVERY]", {
+          callId,
+          event: "grace_cancelled",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    };
+
+    const startReconnectGraceTimer = () => {
+      if (reconnectTimerRef.current) return;
+      console.log("[WEBRTC RECOVERY]", {
+        callId,
+        event: "grace_started",
+        graceMs: RECONNECT_GRACE_MS,
+        timestamp: new Date().toISOString(),
+      });
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null;
-
         if (
-          peer.connectionState !== "connected" &&
-          peer.iceConnectionState !== "connected" &&
-          peer.iceConnectionState !== "completed"
+          peer.connectionState === "disconnected" ||
+          peer.iceConnectionState === "disconnected"
         ) {
-          setConnectionLabel("Connection lost");
-          void finishCall("failed", "connection_lost");
+          console.warn("[WEBRTC RECOVERY]", {
+            callId,
+            event: "grace_expired",
+            peerConnectionState: peer.connectionState,
+            iceConnectionState: peer.iceConnectionState,
+            timestamp: new Date().toISOString(),
+          });
+          setConnectionLabel("Connection issue");
+
+          // Stage 3: only the caller initiates renegotiation so both peers
+          // cannot create competing restart offers at the same time.
+          if (isCaller) {
+            void attemptIceRestart();
+          }
         }
       }, RECONNECT_GRACE_MS);
     };
 
+    const restoreAudioAfterRecovery = () => {
+      try {
+        const mediaType =
+          call?.call_type === "video" ? "video" : "audio";
+
+        // Re-assert the native in-call audio session after a network handoff.
+        // ICE can be connected while iOS still holds a stale audio route.
+        InCallManager.start({
+          media: mediaType,
+          auto: true,
+        });
+        InCallManager.setKeepScreenOn(true);
+        InCallManager.setForceSpeakerphoneOn(
+          speakerOnRef.current
+        );
+
+        // The remote MediaStream survives ICE restart. Make sure its audio
+        // track is still enabled after the transport changes underneath it.
+        const activeRemoteStream =
+          remoteStreamRef.current;
+
+        activeRemoteStream
+          ?.getAudioTracks()
+          .forEach((track) => {
+            track.enabled = true;
+          });
+
+        console.log("[AUDIO RECOVERY]", {
+          callId,
+          event: "audio_route_restored",
+          media: mediaType,
+          speakerOn: speakerOnRef.current,
+          remoteAudioTracks:
+            activeRemoteStream?.getAudioTracks().length ?? 0,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.warn("[AUDIO RECOVERY]", {
+          callId,
+          event: "audio_route_restore_failed",
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+          timestamp: new Date().toISOString(),
+        });
+      }
+    };
+
+    const logConnectionState = (
+      source: "peer" | "ice"
+    ) => {
+      console.log("[WEBRTC STATE]", {
+        callId,
+        source,
+        callStatus: callStatusRef.current,
+        peerConnectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+        timestamp: new Date().toISOString(),
+      });
+    };
+
+    const updateConnectionUi = () => {
+      const peerState = peer.connectionState;
+      const iceState = peer.iceConnectionState;
+
+      if (peerState === "closed" || iceState === "closed") {
+        clearReconnectGraceTimer();
+        return;
+      }
+
+      if (
+        peerState === "connected" ||
+        iceState === "connected" ||
+        iceState === "completed"
+      ) {
+        clearReconnectGraceTimer();
+
+        if (!hasEverConnectedRef.current) {
+          hasEverConnectedRef.current = true;
+
+          if (initialConnectTimerRef.current) {
+            clearTimeout(initialConnectTimerRef.current);
+            initialConnectTimerRef.current = null;
+          }
+
+          console.log("[CALL TIMEOUT]", {
+            callId,
+            event: "initial_connection_established",
+            peerConnectionState: peerState,
+            iceConnectionState: iceState,
+            timestamp: new Date().toISOString(),
+          });
+
+          if (!connectedDiagnosticWrittenRef.current) {
+            connectedDiagnosticWrittenRef.current = true;
+
+            void recordCallDiagnostic(
+              "call_connected",
+              "info",
+              {
+                peerConnectionState: peerState,
+                iceConnectionState: iceState,
+                networkType:
+                  lastNetworkTypeRef.current ?? "unknown",
+              }
+            );
+          }
+        }
+
+        const recoveredFromRestart =
+          iceRestartAttemptRef.current > 0;
+
+        if (recoveredFromRestart) {
+          console.log("[WEBRTC RECOVERY]", {
+            callId,
+            event: "ice_restart_recovered",
+            attempts: iceRestartAttemptRef.current,
+            timestamp: new Date().toISOString(),
+          });
+
+          lifecycleSummaryRef.current.recoverySucceededCount += 1;
+
+          void recordCallDiagnostic(
+            "ice_restart_recovered",
+            "info",
+            {
+              attempts: iceRestartAttemptRef.current,
+              peerConnectionState: peerState,
+              iceConnectionState: iceState,
+              networkType:
+                lastNetworkTypeRef.current ?? "unknown",
+              quality: lastQualitySnapshotRef.current,
+            }
+          );
+
+          iceRestartAttemptRef.current = 0;
+        }
+
+        const shouldRestoreAudio =
+          callStatusRef.current === "accepted" &&
+          (needsAudioRecoveryRef.current || recoveredFromRestart);
+
+        if (shouldRestoreAudio) {
+          // Consume the recovery marker now so multiple connected/completed
+          // callbacks from the same handoff cannot schedule duplicate work.
+          needsAudioRecoveryRef.current = false;
+
+          if (audioRecoveryTimerRef.current) {
+            clearTimeout(audioRecoveryTimerRef.current);
+          }
+
+          console.log("[AUDIO RECOVERY]", {
+            callId,
+            event: "audio_restore_scheduled",
+            recoveredFromRestart,
+            peerConnectionState: peerState,
+            iceConnectionState: iceState,
+            timestamp: new Date().toISOString(),
+          });
+
+          // Let the newly selected ICE path settle before reasserting the
+          // native in-call route.
+          audioRecoveryTimerRef.current = setTimeout(() => {
+            audioRecoveryTimerRef.current = null;
+            restoreAudioAfterRecovery();
+          }, 500);
+        }
+
+        setConnectionLabel("Connected");
+
+        setTimeout(() => {
+          void logSelectedIcePath(peer);
+        }, 800);
+
+        return;
+      }
+
+      if (
+        peerState === "disconnected" ||
+        iceState === "disconnected"
+      ) {
+        if (callStatusRef.current === "accepted") {
+          needsAudioRecoveryRef.current = true;
+        }
+
+        setConnectionLabel("Reconnecting…");
+
+        // During active renegotiation on the callee, don't start another
+        // grace timer for the same recovery cycle.
+        if (
+          isCaller ||
+          !lastHandledRestartOfferSdpRef.current ||
+          peer.signalingState === "stable"
+        ) {
+          startReconnectGraceTimer();
+        }
+
+        return;
+      }
+
+      if (peerState === "failed" || iceState === "failed") {
+        if (callStatusRef.current === "accepted") {
+          needsAudioRecoveryRef.current = true;
+        }
+
+        clearReconnectGraceTimer();
+        setConnectionLabel("Connection issue");
+
+        if (isCaller) {
+          void attemptIceRestart();
+        }
+        return;
+      }
+
+      if (peerState === "connecting" || iceState === "checking") {
+        setConnectionLabel("Connecting…");
+      }
+    };
+
     peer.onconnectionstatechange = () => {
       const state = peer.connectionState;
-
-      if (state === "connected") {
-        clearReconnectTimer();
-        setConnectionLabel("Connected");
-      } else if (state === "connecting") {
-        setConnectionLabel("Connecting…");
-      } else if (
-        state === "disconnected" ||
-        state === "failed"
-      ) {
-        beginReconnectGrace();
-      }
+      setPeerConnectionState(state);
+      logConnectionState("peer");
+      updateConnectionUi();
     };
 
     peer.oniceconnectionstatechange = () => {
       const state = peer.iceConnectionState;
-
-      if (state === "connected" || state === "completed") {
-        clearReconnectTimer();
-        setConnectionLabel("Connected");
-      } else if (state === "checking") {
-        setConnectionLabel("Connecting…");
-      } else if (
-        state === "failed" ||
-        state === "disconnected"
-      ) {
-        beginReconnectGrace();
-      }
+      setIceConnectionState(state);
+      logConnectionState("ice");
+      updateConnectionUi();
     };
 
     peer.ontrack = (event: any) => {
       const incomingStream = event.streams?.[0];
 
       if (incomingStream) {
+        remoteStreamRef.current = incomingStream;
         setRemoteStream(incomingStream);
         if (
           incomingStream.getVideoTracks().length > 0
@@ -475,6 +1741,8 @@ export default function CallScreen() {
             nextStream.addTrack(event.track);
           }
 
+          remoteStreamRef.current = nextStream;
+
           if (event.track.kind === "video") {
             setRemoteVideoAvailable(true);
 
@@ -495,7 +1763,14 @@ export default function CallScreen() {
 
     peerRef.current = peer;
     return peer;
-  }, [call?.call_type, callId, user]);
+  }, [
+    call?.call_type,
+    callId,
+    extractCandidateIceUfrag,
+    isCaller,
+    logSelectedIcePath,
+    user,
+  ]);
 
   const createOffer = useCallback(async () => {
     if (!callId || offerCreatedRef.current) return;
@@ -548,11 +1823,27 @@ export default function CallScreen() {
   ]);
 
   const acceptCall = useCallback(async () => {
-    if (!callId || !call?.offer || preparing) return;
+    if (!callId || !call?.offer) {
+      return;
+    }
+
+    if (acceptInFlightRef.current) {
+      console.log("[CALL RACE]", {
+        callId,
+        event: "duplicate_accept_ignored",
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // A ref changes synchronously, unlike React state. This closes the tiny
+    // window where two Accept events can arrive before `preparing` re-renders.
+    acceptInFlightRef.current = true;
     setPreparing(true);
+
     try {
       const peer = await preparePeer();
-      await peer.setRemoteDescription(new RTCSessionDescription(call.offer));
+      await peer.setRemoteDescription(new RTCSessionDescription(call.offer as any));
       remoteDescriptionReadyRef.current = true;
       await flushCandidates();
       await syncRemoteCandidates();
@@ -588,6 +1879,7 @@ export default function CallScreen() {
         error instanceof Error ? error.message : "Could not answer the call.",
       );
     } finally {
+      acceptInFlightRef.current = false;
       setPreparing(false);
     }
   }, [
@@ -619,7 +1911,18 @@ export default function CallScreen() {
       status: CallStatus = "ended",
       reason = "local_hangup"
     ) => {
-      if (!callId || endedLocallyRef.current) {
+      if (!callId) {
+        return;
+      }
+
+      if (endedLocallyRef.current) {
+        console.log("[CALL RACE]", {
+          callId,
+          event: "duplicate_finish_ignored",
+          requestedStatus: status,
+          requestedReason: reason,
+          timestamp: new Date().toISOString(),
+        });
         return;
       }
 
@@ -639,12 +1942,18 @@ export default function CallScreen() {
 
       try {
         if (expectedStatuses.length > 0) {
+          const nowIso = new Date().toISOString();
           const { data: transition, error: transitionError } = await supabase
             .from("calls")
-            .update({ status })
+            .update({
+              status,
+              end_reason: reason,
+              ended_at: nowIso,
+              last_state_changed_at: nowIso,
+            })
             .eq("id", callId)
             .in("status", expectedStatuses)
-            .select("id, status")
+            .select("id, status, end_reason")
             .maybeSingle();
 
           if (transitionError) {
@@ -675,6 +1984,55 @@ export default function CallScreen() {
             return;
           }
         }
+
+        if (!lifecycleSummaryWrittenRef.current) {
+          lifecycleSummaryWrittenRef.current = true;
+
+          const summary = {
+            ...lifecycleSummaryRef.current,
+            finalStatus: status,
+            finalReason: reason,
+            finalNetworkType:
+              lastNetworkTypeRef.current ?? "unknown",
+            finalPeerConnectionState:
+              peerRef.current?.connectionState ?? "closed",
+            finalIceConnectionState:
+              peerRef.current?.iceConnectionState ?? "closed",
+            finalQuality:
+              lastQualitySnapshotRef.current,
+            hadLifecycleActivity:
+              lifecycleSummaryRef.current.backgroundCount > 0 ||
+              lifecycleSummaryRef.current.jsSuspensionCount > 0 ||
+              lifecycleSummaryRef.current.backgroundNetworkChangeCount > 0 ||
+              lifecycleSummaryRef.current.recoveryRequiredCount > 0,
+          };
+
+          console.log("[CALL LIFECYCLE SUMMARY]", {
+            callId,
+            event: "lifecycle_summary",
+            ...summary,
+            timestamp: new Date().toISOString(),
+          });
+
+          void recordCallDiagnostic(
+            "lifecycle_summary",
+            status === "failed" ? "warning" : "info",
+            summary
+          );
+        }
+
+        void recordCallDiagnostic(
+          "call_terminal",
+          status === "failed" ? "error" : "info",
+          {
+            status,
+            reason,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+            finalQuality:
+              lastQualitySnapshotRef.current,
+          }
+        );
 
         cleanupMedia();
 
@@ -710,8 +2068,92 @@ export default function CallScreen() {
 
       closeCallScreen();
     },
-    [callId, cleanupMedia]
+    [callId, cleanupMedia, recordCallDiagnostic]
   );
+
+  useEffect(() => {
+    if (!callId || call?.status !== "accepted") {
+      if (initialConnectTimerRef.current) {
+        clearTimeout(initialConnectTimerRef.current);
+        initialConnectTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (hasEverConnectedRef.current) {
+      return;
+    }
+
+    const peer = peerRef.current;
+    const alreadyConnected =
+      peer?.connectionState === "connected" ||
+      peer?.iceConnectionState === "connected" ||
+      peer?.iceConnectionState === "completed";
+
+    if (alreadyConnected) {
+      hasEverConnectedRef.current = true;
+      return;
+    }
+
+    if (initialConnectTimerRef.current) {
+      return;
+    }
+
+    console.log("[CALL TIMEOUT]", {
+      callId,
+      event: "initial_connect_timer_started",
+      timeoutMs: INITIAL_CONNECT_TIMEOUT_MS,
+      peerConnectionState: peer?.connectionState ?? null,
+      iceConnectionState: peer?.iceConnectionState ?? null,
+      timestamp: new Date().toISOString(),
+    });
+
+    initialConnectTimerRef.current = setTimeout(() => {
+      initialConnectTimerRef.current = null;
+
+      const activePeer = peerRef.current;
+      const connected =
+        hasEverConnectedRef.current ||
+        activePeer?.connectionState === "connected" ||
+        activePeer?.iceConnectionState === "connected" ||
+        activePeer?.iceConnectionState === "completed";
+
+      if (
+        callStatusRef.current !== "accepted" ||
+        connected ||
+        endedLocallyRef.current
+      ) {
+        console.log("[CALL TIMEOUT]", {
+          callId,
+          event: "initial_connect_timeout_cancelled",
+          callStatus: callStatusRef.current,
+          connected,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      console.warn("[CALL TIMEOUT]", {
+        callId,
+        event: "initial_connect_timeout_expired",
+        peerConnectionState:
+          activePeer?.connectionState ?? null,
+        iceConnectionState:
+          activePeer?.iceConnectionState ?? null,
+        timestamp: new Date().toISOString(),
+      });
+
+      setConnectionLabel("Unable to connect");
+      void finishCall("failed", "connecting_timeout");
+    }, INITIAL_CONNECT_TIMEOUT_MS);
+
+    return () => {
+      if (initialConnectTimerRef.current) {
+        clearTimeout(initialConnectTimerRef.current);
+        initialConnectTimerRef.current = null;
+      }
+    };
+  }, [call?.status, callId, finishCall]);
 
   const finishMissedIfStillRinging = useCallback(
     async (reason = "unanswered") => {
@@ -721,7 +2163,9 @@ export default function CallScreen() {
 
       const { data, error } = await supabase
         .from("calls")
-        .select("status, created_at, expires_at")
+        .select(
+          "status, created_at, expires_at, ringing_acknowledged_at"
+        )
         .eq("id", callId)
         .maybeSingle();
 
@@ -746,7 +2190,24 @@ export default function CallScreen() {
         return;
       }
 
-      await finishCall("missed", reason);
+      const wasAcknowledged = Boolean(
+        data.ringing_acknowledged_at
+      );
+
+      console.log("[CALL DELIVERY]", {
+        callId,
+        event: wasAcknowledged
+          ? "unanswered_after_delivery"
+          : "unreachable_no_acknowledgement",
+        ringingAcknowledgedAt:
+          data.ringing_acknowledged_at ?? null,
+        timestamp: new Date().toISOString(),
+      });
+
+      await finishCall(
+        wasAcknowledged ? "missed" : "failed",
+        wasAcknowledged ? reason : "unreachable"
+      );
     },
     [callId, finishCall]
   );
@@ -763,12 +2224,157 @@ export default function CallScreen() {
   }, [call?.status, finishCall, isCaller]);
 
   useEffect(() => {
+    // A CallKit waiting-call switch can replace /call/[callId] with another
+    // call while this screen component is still mounted. Reset all per-call
+    // guards so the new incoming call can initialize and answer normally.
+    if (terminalNavigationTimerRef.current) {
+      clearTimeout(terminalNavigationTimerRef.current);
+      terminalNavigationTimerRef.current = null;
+    }
+
+    cleanupMedia();
+    remoteDescriptionReadyRef.current = false;
+    pendingCandidatesRef.current = [];
+    offerCreatedRef.current = false;
+    answerAppliedRef.current = false;
+    answerApplyingRef.current = false;
+    hasEverConnectedRef.current = false;
+    lastInboundPacketsRef.current = -1;
+    lastPeerLivenessWriteAtRef.current = 0;
+    lastStaleAcceptedCheckAtRef.current = 0;
+    lastQualitySnapshotRef.current = null;
+    connectedDiagnosticWrittenRef.current = false;
+    iceRestartInProgressRef.current = false;
+    iceRestartAttemptRef.current = 0;
+    lastIceRestartStartedAtRef.current = 0;
+    lastHandledRestartOfferSdpRef.current = null;
+    lastAnsweredRestartOfferSdpRef.current = null;
+    lastNetworkTypeRef.current = null;
+    lastNetworkConnectedRef.current = null;
+    lastNetworkReachableRef.current = null;
+    lastNetworkRecoveryAtRef.current = 0;
+    lifecycleStateRef.current = AppState.currentState;
+    backgroundedAtRef.current = null;
+    backgroundNetworkSnapshotRef.current = null;
+    lifecycleSummaryRef.current = {
+      backgroundCount: 0,
+      resumeCount: 0,
+      totalBackgroundMs: 0,
+      longestBackgroundMs: 0,
+      jsSuspensionCount: 0,
+      backgroundNetworkChangeCount: 0,
+      recoveryRequiredCount: 0,
+      recoverySucceededCount: 0,
+      unlockAudioRestoreCount: 0,
+      firstBackgroundAt: null,
+      lastResumeAt: null,
+      lastNetworkFrom: null,
+      lastNetworkTo: null,
+    };
+    lifecycleSummaryWrittenRef.current = false;
+
+    if (backgroundNetworkVerifyTimerRef.current) {
+      clearTimeout(backgroundNetworkVerifyTimerRef.current);
+      backgroundNetworkVerifyTimerRef.current = null;
+    }
+
+    if (lifecycleAudioRestoreTimerRef.current) {
+      clearTimeout(lifecycleAudioRestoreTimerRef.current);
+      lifecycleAudioRestoreTimerRef.current = null;
+    }
+
+    lastJsHeartbeatAtRef.current = Date.now();
+
+    if (postSuspensionVerifyTimerRef.current) {
+      clearTimeout(postSuspensionVerifyTimerRef.current);
+      postSuspensionVerifyTimerRef.current = null;
+    }
+
+    requestIceRestartRef.current = null;
+    activeIceServersRef.current = [];
+    needsAudioRecoveryRef.current = false;
+    nativeAnswerAppliedRef.current = false;
+    acceptInFlightRef.current = false;
+    nativeOutgoingStartedRef.current = false;
+    nativeConnectedRef.current = false;
+    endedLocallyRef.current = false;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    if (audioRecoveryTimerRef.current) {
+      clearTimeout(audioRecoveryTimerRef.current);
+      audioRecoveryTimerRef.current = null;
+    }
+
+    if (backgroundNetworkVerifyTimerRef.current) {
+      clearTimeout(backgroundNetworkVerifyTimerRef.current);
+      backgroundNetworkVerifyTimerRef.current = null;
+    }
+
+    if (lifecycleAudioRestoreTimerRef.current) {
+      clearTimeout(lifecycleAudioRestoreTimerRef.current);
+      lifecycleAudioRestoreTimerRef.current = null;
+    }
+
+    if (postSuspensionVerifyTimerRef.current) {
+      clearTimeout(postSuspensionVerifyTimerRef.current);
+      postSuspensionVerifyTimerRef.current = null;
+    }
+
+    setPeerConnectionState("new");
+    setIceConnectionState("new");
+    appliedCandidateKeysRef.current.clear();
+
+    setCall(null);
+    setOtherProfile(null);
+    setLoading(true);
+    setPreparing(false);
+    setMuted(false);
+    setHoldUpdating(false);
+    setSpeakerOn(false);
+    speakerOnRef.current = false;
+    setCameraEnabled(true);
+    cameraEnabledRef.current = true;
+    setFrontCamera(true);
+    setElapsedSeconds(0);
+    setConnectionLabel("Preparing call…");
+    setNetworkQuality("Unknown");
+    setRemoteVideoAvailable(false);
+  }, [callId, cleanupMedia]);
+
+  useEffect(() => {
+    callStatusRef.current = call?.status ?? null;
+  }, [call?.status]);
+
+  useEffect(() => {
+    speakerOnRef.current = speakerOn;
+  }, [speakerOn]);
+
+  useEffect(() => {
     if (!callId || !user) return;
     let mounted = true;
 
     const load = async () => {
       try {
         await expireStaleCalls();
+
+        const { error: staleAcceptedError } =
+          await supabase.rpc(
+            "expire_stale_accepted_call",
+            {
+              requested_call_id: callId,
+            }
+          );
+
+        if (staleAcceptedError) {
+          console.warn(
+            "[CALL LIVENESS] load_stale_check_failed",
+            staleAcceptedError.message
+          );
+        }
+
         const { data, error } = await supabase
           .from("calls")
           .select("*")
@@ -777,6 +2383,14 @@ export default function CallScreen() {
         if (error) throw error;
         const loadedCall = data as VoiceCall;
         if (!mounted) return;
+
+        console.log("[CALL RECONCILE]", {
+          callId,
+          event: "call_load_reconciled",
+          status: loadedCall.status,
+          endReason: loadedCall.end_reason ?? null,
+          timestamp: new Date().toISOString(),
+        });
 
         if (isTerminalCallStatus(loadedCall.status)) {
           cleanupMedia();
@@ -841,6 +2455,74 @@ export default function CallScreen() {
   ]);
 
   useEffect(() => {
+    if (
+      !callId ||
+      !call ||
+      !user ||
+      !isIncoming ||
+      call.status !== "ringing" ||
+      call.ringing_acknowledged_at
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const acknowledge = async () => {
+      const { error } = await supabase.rpc(
+        "acknowledge_incoming_call",
+        {
+          requested_call_id: callId,
+        }
+      );
+
+      if (error) {
+        console.warn(
+          "Could not acknowledge incoming call:",
+          error.message
+        );
+        return;
+      }
+
+      if (cancelled) {
+        return;
+      }
+
+      const acknowledgedAt = new Date().toISOString();
+
+      setCall((current) =>
+        current && current.id === callId
+          ? {
+              ...current,
+              ringing_acknowledged_at:
+                current.ringing_acknowledged_at ??
+                acknowledgedAt,
+            }
+          : current
+      );
+
+      console.log("[CALL DELIVERY]", {
+        callId,
+        event: "incoming_call_acknowledged",
+        timestamp: acknowledgedAt,
+      });
+    };
+
+    void acknowledge();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    call?.id,
+    call?.ringing_acknowledged_at,
+    call?.status,
+    callId,
+    isIncoming,
+    user,
+  ]);
+
+  useEffect(() => {
     if (!call || !user || !isCaller || call.status !== "ringing") return;
     void createOffer();
   }, [call, createOffer, isCaller, user]);
@@ -880,6 +2562,247 @@ export default function CallScreen() {
     nativeConnectedRef.current = true;
     markNativeOutgoingCallConnected(callId);
   }, [call?.status, callId]);
+
+
+
+  useEffect(() => {
+    if (!callId) {
+      return;
+    }
+
+    const subscription = Network.addNetworkStateListener((state) => {
+      const nextType = String(state.type ?? "unknown");
+      const nextConnected = state.isConnected ?? null;
+      const nextReachable = state.isInternetReachable ?? null;
+
+      const previousType = lastNetworkTypeRef.current;
+      const previousConnected = lastNetworkConnectedRef.current;
+      const previousReachable = lastNetworkReachableRef.current;
+
+      if (
+        previousType === null &&
+        previousConnected === null &&
+        previousReachable === null
+      ) {
+        lastNetworkTypeRef.current = nextType;
+        lastNetworkConnectedRef.current = nextConnected;
+        lastNetworkReachableRef.current = nextReachable;
+
+        console.log("[NETWORK STATE]", {
+          callId,
+          event: "network_baseline",
+          type: nextType,
+          isConnected: nextConnected,
+          isInternetReachable: nextReachable,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const typeChanged = previousType !== nextType;
+      const connectionChanged = previousConnected !== nextConnected;
+      const reachabilityChanged = previousReachable !== nextReachable;
+
+      if (!typeChanged && !connectionChanged && !reachabilityChanged) {
+        return;
+      }
+
+      lastNetworkTypeRef.current = nextType;
+      lastNetworkConnectedRef.current = nextConnected;
+      lastNetworkReachableRef.current = nextReachable;
+
+      const peer = peerRef.current;
+      const peerState = peer?.connectionState ?? "closed";
+      const iceState = peer?.iceConnectionState ?? "closed";
+
+      console.log("[NETWORK STATE]", {
+        callId,
+        event: "network_changed",
+        from: {
+          type: previousType,
+          isConnected: previousConnected,
+          isInternetReachable: previousReachable,
+        },
+        to: {
+          type: nextType,
+          isConnected: nextConnected,
+          isInternetReachable: nextReachable,
+        },
+        peerConnectionState: peerState,
+        iceConnectionState: iceState,
+        callStatus: callStatusRef.current,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (callStatusRef.current === "accepted") {
+        void recordCallDiagnostic(
+          "network_changed",
+          nextConnected === false ||
+          nextReachable === false
+            ? "warning"
+            : "info",
+          {
+            from: {
+              type: previousType,
+              isConnected: previousConnected,
+              isInternetReachable: previousReachable,
+            },
+            to: {
+              type: nextType,
+              isConnected: nextConnected,
+              isInternetReachable: nextReachable,
+            },
+            peerConnectionState: peerState,
+            iceConnectionState: iceState,
+          }
+        );
+      }
+
+      const networkUnavailable =
+        nextConnected === false || nextReachable === false;
+
+      if (networkUnavailable) {
+        if (callStatusRef.current === "accepted") {
+          needsAudioRecoveryRef.current = true;
+          setConnectionLabel("Reconnecting…");
+
+          console.log("[AUDIO RECOVERY]", {
+            callId,
+            event: "audio_recovery_marked_network_loss",
+            type: nextType,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return;
+      }
+
+      const networkAvailable =
+        nextConnected === true && nextReachable === true;
+
+      if (
+        typeChanged &&
+        callStatusRef.current === "accepted"
+      ) {
+        needsAudioRecoveryRef.current = true;
+
+        console.log("[AUDIO RECOVERY]", {
+          callId,
+          event: "audio_recovery_marked_network_handoff",
+          fromType: previousType,
+          toType: nextType,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const peerDegraded =
+        peerState === "disconnected" ||
+        peerState === "failed" ||
+        iceState === "disconnected" ||
+        iceState === "failed";
+
+      if (
+        !networkAvailable ||
+        !peerDegraded ||
+        callStatusRef.current !== "accepted" ||
+        !isCaller ||
+        !requestIceRestartRef.current
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+
+      if (now - lastNetworkRecoveryAtRef.current < 2500) {
+        console.log("[NETWORK RECOVERY]", {
+          callId,
+          event: "network_restart_ignored_duplicate",
+          type: nextType,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      lastNetworkRecoveryAtRef.current = now;
+
+      console.log("[NETWORK RECOVERY]", {
+        callId,
+        event: "network_recovery_requested",
+        type: nextType,
+        peerConnectionState: peerState,
+        iceConnectionState: iceState,
+        timestamp: new Date().toISOString(),
+      });
+
+      requestIceRestartRef.current();
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [callId, isCaller]);
+
+  useEffect(() => {
+    const shouldPlayRingback = Boolean(
+      call && isCaller && call.status === "ringing"
+    );
+
+    let cancelled = false;
+    let repeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const playCadence = async () => {
+      if (cancelled) {
+        return;
+      }
+
+      try {
+        // outgoing-ringback.wav is one complete 6-second cadence:
+        // 2 seconds audible + 4 seconds silence.
+        await ringbackPlayer.seekTo(0).catch(() => undefined);
+
+        if (!cancelled) {
+          ringbackPlayer.play();
+        }
+      } catch (error) {
+        console.warn(
+          "Could not play outgoing ringback:",
+          error instanceof Error ? error.message : error
+        );
+      }
+    };
+
+    if (shouldPlayRingback) {
+      ringbackPlayer.loop = false;
+      ringbackPlayer.volume = 0.42;
+
+      void playCadence();
+
+      // Explicit JavaScript-controlled repeat every 6 seconds.
+      repeatTimer = setInterval(() => {
+        void playCadence();
+      }, 6000);
+    }
+
+    // IMPORTANT:
+    // When ringing ends because the call was answered, do not call pause()
+    // or seekTo() here. On iOS that can interfere with the shared audio
+    // session exactly when WebRTC/InCallManager is taking control, leaving
+    // the connected call silent. Stopping the repeat timer is enough.
+
+    return () => {
+      cancelled = true;
+
+      if (repeatTimer) {
+        clearInterval(repeatTimer);
+      }
+
+      // Do not pause/release here. useAudioPlayer owns the native
+      // lifecycle and auto-disposes the player on unmount.
+    };
+  }, [
+    call?.status,
+    isCaller,
+    ringbackPlayer,
+  ]);
 
   useEffect(() => {
     if (!call || call.status !== "ringing" || !isCaller) {
@@ -922,7 +2845,10 @@ export default function CallScreen() {
   ]);
 
   useEffect(() => {
-    if (!callId || !user) return;
+    if (!callId || !user || !call) return;
+
+    const currentIsCaller = call.caller_id === user.id;
+    const currentIsVideoCall = call.call_type === "video";
 
     const callChannel = supabase
       .channel(`call-${callId}`)
@@ -940,10 +2866,28 @@ export default function CallScreen() {
 
           if (
             updated.status === "accepted" &&
+            updated.offer &&
+            updated.callee_id === user.id
+          ) {
+            await handleRemoteIceRestartOffer(
+              updated.offer as Record<string, unknown>,
+            );
+          }
+
+          if (
+            updated.status === "accepted" &&
             updated.answer &&
             updated.caller_id === user.id
           ) {
             await applyRemoteAnswer(updated.answer);
+          }
+
+          // Supabase is the authoritative lifecycle state. Once the call is
+          // accepted, keep the UI synchronized even if a WebRTC connection
+          // callback is delayed on one device. Hold messaging is rendered
+          // separately from connectionLabel.
+          if (updated.status === "accepted") {
+            setConnectionLabel("Connected");
           }
 
           if (isTerminalCallStatus(updated.status)) {
@@ -958,17 +2902,20 @@ export default function CallScreen() {
                     ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
                     : CALLKIT_END_REASONS.REMOTE_ENDED,
             );
-            const labels: Record<string, string> = {
-              declined: "Call declined",
-              missed: "No answer",
-              failed: "Call failed",
-              ended: "Call ended",
-            };
-
             setConnectionLabel(
-              labels[updated.status] ?? "Call ended"
+              terminalCallLabel(
+                updated.status,
+                updated.end_reason
+              )
             );
-            setTimeout(() => closeCallScreen(), 650);
+            if (terminalNavigationTimerRef.current) {
+              clearTimeout(terminalNavigationTimerRef.current);
+            }
+
+            terminalNavigationTimerRef.current = setTimeout(() => {
+              terminalNavigationTimerRef.current = null;
+              closeCallScreen();
+            }, 650);
           }
         },
       )
@@ -1002,13 +2949,13 @@ export default function CallScreen() {
         if (status === "SUBSCRIBED") {
           callChannelRef.current = callChannel;
 
-          if (isVideoCall) {
+          if (currentIsVideoCall) {
             void callChannel.send({
               type: "broadcast",
               event: "camera-state",
               payload: {
                 user_id: user.id,
-                enabled: cameraEnabled,
+                enabled: cameraEnabledRef.current,
               },
             });
           }
@@ -1020,7 +2967,13 @@ export default function CallScreen() {
     const recoveryTimer = setInterval(() => {
       void syncRemoteCandidates();
 
-      if (isCaller && !answerAppliedRef.current) {
+      if (
+        currentIsCaller &&
+        (
+          !answerAppliedRef.current ||
+          peerRef.current?.signalingState === "have-local-offer"
+        )
+      ) {
         void supabase
           .from("calls")
           .select("answer, status")
@@ -1049,13 +3002,13 @@ export default function CallScreen() {
   }, [
     addRemoteCandidate,
     applyRemoteAnswer,
+    handleRemoteIceRestartOffer,
     callId,
+    call?.caller_id,
+    call?.call_type,
     cleanupMedia,
-    cameraEnabled,
-    isCaller,
-    isVideoCall,
     syncRemoteCandidates,
-    user,
+    user?.id,
   ]);
 
   useEffect(() => {
@@ -1070,33 +3023,1154 @@ export default function CallScreen() {
   }, [call?.answered_at, call?.status]);
 
   useEffect(() => {
-    const subscription = AppState.addEventListener(
-      "change",
-      (state) => {
-        if (state !== "active" || !callId) {
+    if (
+      !callId ||
+      !call ||
+      !user ||
+      call.status !== "accepted"
+    ) {
+      return;
+    }
+
+    const observedUserId =
+      call.caller_id === user.id
+        ? call.callee_id
+        : call.caller_id;
+
+    let cancelled = false;
+    let sampleInFlight = false;
+
+    const samplePeerLiveness = async () => {
+      if (cancelled || sampleInFlight) {
+        return;
+      }
+
+      sampleInFlight = true;
+
+      try {
+        const peer = peerRef.current;
+
+        if (
+          !peer ||
+          peer.connectionState === "closed" ||
+          isTerminalCallStatus(callStatusRef.current ?? "")
+        ) {
           return;
         }
 
-        void expireStaleCalls();
-        void syncRemoteCandidates();
+        const reports = await peer.getStats();
+        let inboundPackets = 0;
 
-        void supabase
+        reports?.forEach((report: any) => {
+          if (
+            report.type === "inbound-rtp" &&
+            !report.isRemote
+          ) {
+            inboundPackets +=
+              Number(report.packetsReceived ?? 0);
+          }
+        });
+
+        const previousPackets =
+          lastInboundPacketsRef.current;
+
+        lastInboundPacketsRef.current =
+          inboundPackets;
+
+        const receivedNewMedia =
+          previousPackets < 0
+            ? inboundPackets > 0
+            : inboundPackets > previousPackets;
+
+        const now = Date.now();
+
+        if (
+          receivedNewMedia &&
+          now - lastPeerLivenessWriteAtRef.current >=
+            PEER_LIVENESS_WRITE_MIN_MS
+        ) {
+          const { error } = await supabase.rpc(
+            "touch_call_peer_liveness",
+            {
+              requested_call_id: callId,
+              observed_user_id: observedUserId,
+            }
+          );
+
+          if (error) {
+            console.warn(
+              "[CALL LIVENESS] peer_touch_failed",
+              error.message
+            );
+          } else {
+            lastPeerLivenessWriteAtRef.current =
+              now;
+
+            console.log("[CALL LIVENESS]", {
+              callId,
+              event: "peer_media_observed",
+              observedUserId,
+              inboundPackets,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+
+        if (
+          now - lastStaleAcceptedCheckAtRef.current >=
+            STALE_ACCEPTED_CHECK_MS
+        ) {
+          lastStaleAcceptedCheckAtRef.current =
+            now;
+
+          const {
+            data: expired,
+            error: expireError,
+          } = await supabase.rpc(
+            "expire_stale_accepted_call",
+            {
+              requested_call_id: callId,
+            }
+          );
+
+          if (expireError) {
+            console.warn(
+              "[CALL LIVENESS] stale_check_failed",
+              expireError.message
+            );
+          } else if (expired === true) {
+            console.warn("[CALL LIVENESS]", {
+              callId,
+              event: "stale_accepted_call_expired",
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      } catch (error) {
+        // Liveness is a backstop only. A stats/RPC problem must never tear
+        // down an otherwise healthy call.
+        console.warn(
+          "[CALL LIVENESS] sample_failed",
+          error instanceof Error
+            ? error.message
+            : String(error)
+        );
+      } finally {
+        sampleInFlight = false;
+      }
+    };
+
+    void samplePeerLiveness();
+
+    const timer = setInterval(
+      samplePeerLiveness,
+      PEER_LIVENESS_SAMPLE_MS
+    );
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [
+    call?.callee_id,
+    call?.caller_id,
+    call?.status,
+    callId,
+    user,
+  ]);
+
+  useEffect(() => {
+    if (call?.status !== "accepted") {
+      lastJsHeartbeatAtRef.current = Date.now();
+      return;
+    }
+
+    lastJsHeartbeatAtRef.current = Date.now();
+
+    const timer = setInterval(() => {
+      lastJsHeartbeatAtRef.current = Date.now();
+    }, JS_HEARTBEAT_INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, [call?.status, callId]);
+
+  useEffect(() => {
+    let resumeReconcileInFlight = false;
+
+    const reconcileOnResume = async (
+      previousLifecycleState: string,
+      backgroundDurationMs: number | null,
+      suspensionGapMs: number | null,
+      backgroundNetwork: {
+        type: string | null;
+        isConnected: boolean | null;
+        isInternetReachable: boolean | null;
+      } | null
+    ) => {
+      if (!callId || resumeReconcileInFlight) {
+        return;
+      }
+
+      resumeReconcileInFlight = true;
+
+      try {
+        const networkState =
+          await Network.getNetworkStateAsync().catch(
+            () => null
+          );
+
+        const resumedNetwork = networkState
+          ? {
+              type: String(
+                networkState.type ?? "unknown"
+              ),
+              isConnected:
+                networkState.isConnected ?? null,
+              isInternetReachable:
+                networkState.isInternetReachable ?? null,
+            }
+          : {
+              type: lastNetworkTypeRef.current,
+              isConnected:
+                lastNetworkConnectedRef.current,
+              isInternetReachable:
+                lastNetworkReachableRef.current,
+            };
+
+        const backgroundNetworkChanged = Boolean(
+          backgroundNetwork &&
+          (
+            backgroundNetwork.type !== resumedNetwork.type ||
+            backgroundNetwork.isConnected !==
+              resumedNetwork.isConnected ||
+            backgroundNetwork.isInternetReachable !==
+              resumedNetwork.isInternetReachable
+          )
+        );
+
+        lastNetworkTypeRef.current =
+          resumedNetwork.type;
+        lastNetworkConnectedRef.current =
+          resumedNetwork.isConnected;
+        lastNetworkReachableRef.current =
+          resumedNetwork.isInternetReachable;
+
+        if (
+          backgroundNetworkChanged &&
+          callStatusRef.current === "accepted"
+        ) {
+          lifecycleSummaryRef.current.backgroundNetworkChangeCount += 1;
+          lifecycleSummaryRef.current.lastNetworkFrom =
+            backgroundNetwork?.type ?? null;
+          lifecycleSummaryRef.current.lastNetworkTo =
+            resumedNetwork.type ?? null;
+
+          console.log("[BACKGROUND NETWORK]", {
+            callId,
+            event: "background_network_change_detected",
+            from: backgroundNetwork,
+            to: resumedNetwork,
+            backgroundDurationMs,
+            suspensionGapMs,
+            peerConnectionState:
+              peerRef.current?.connectionState ?? null,
+            iceConnectionState:
+              peerRef.current?.iceConnectionState ?? null,
+            timestamp: new Date().toISOString(),
+          });
+
+          void recordCallDiagnostic(
+            "background_network_change_detected",
+            "warning",
+            {
+              from: backgroundNetwork,
+              to: resumedNetwork,
+              backgroundDurationMs,
+              suspensionGapMs,
+              peerConnectionState:
+                peerRef.current?.connectionState ?? null,
+              iceConnectionState:
+                peerRef.current?.iceConnectionState ?? null,
+            }
+          );
+
+          needsAudioRecoveryRef.current = true;
+        }
+
+        // Backgrounding by itself never triggers recovery. We first reconcile
+        // Supabase, then inspect the actual network + WebRTC state.
+        await expireStaleCalls();
+
+        const { error: staleAcceptedError } =
+          await supabase.rpc(
+            "expire_stale_accepted_call",
+            {
+              requested_call_id: callId,
+            }
+          );
+
+        if (staleAcceptedError) {
+          console.warn(
+            "[CALL LIVENESS] resume_stale_check_failed",
+            staleAcceptedError.message
+          );
+        }
+
+        const { data, error } = await supabase
           .from("calls")
           .select("*")
           .eq("id", callId)
-          .maybeSingle()
-          .then(({ data }) => {
-            if (data) {
-              setCall(data as VoiceCall);
-            }
+          .maybeSingle();
+
+        if (error) {
+          console.warn(
+            "[CALL RECONCILE] resume_read_failed",
+            error.message
+          );
+          return;
+        }
+
+        if (!data) {
+          console.warn("[CALL RECONCILE]", {
+            callId,
+            event: "resume_call_missing",
+            timestamp: new Date().toISOString(),
           });
+
+          cleanupMedia();
+          endNativeCall(
+            callId,
+            CALLKIT_END_REASONS.REMOTE_ENDED
+          );
+          closeCallScreen();
+          return;
+        }
+
+        const authoritativeCall = data as VoiceCall;
+
+        console.log("[CALL RECONCILE]", {
+          callId,
+          event: "app_resume_reconciled",
+          previousLifecycleState,
+          backgroundDurationMs,
+          suspensionGapMs,
+          backgroundNetwork,
+          resumedNetwork,
+          backgroundNetworkChanged,
+          localStatus: callStatusRef.current,
+          authoritativeStatus: authoritativeCall.status,
+          endReason: authoritativeCall.end_reason ?? null,
+          networkType:
+            lastNetworkTypeRef.current ?? "unknown",
+          isConnected:
+            lastNetworkConnectedRef.current,
+          isInternetReachable:
+            lastNetworkReachableRef.current,
+          timestamp: new Date().toISOString(),
+        });
+
+        setCall(authoritativeCall);
+
+        if (isTerminalCallStatus(authoritativeCall.status)) {
+          if (!lifecycleSummaryWrittenRef.current) {
+            lifecycleSummaryWrittenRef.current = true;
+
+            const summary = {
+              ...lifecycleSummaryRef.current,
+              finalStatus: authoritativeCall.status,
+              finalReason:
+                authoritativeCall.end_reason ?? null,
+              finalNetworkType:
+                lastNetworkTypeRef.current ?? "unknown",
+              finalPeerConnectionState:
+                peerRef.current?.connectionState ?? "closed",
+              finalIceConnectionState:
+                peerRef.current?.iceConnectionState ?? "closed",
+              finalQuality:
+                lastQualitySnapshotRef.current,
+              hadLifecycleActivity:
+                lifecycleSummaryRef.current.backgroundCount > 0 ||
+                lifecycleSummaryRef.current.jsSuspensionCount > 0 ||
+                lifecycleSummaryRef.current.backgroundNetworkChangeCount > 0 ||
+                lifecycleSummaryRef.current.recoveryRequiredCount > 0,
+            };
+
+            console.log("[CALL LIFECYCLE SUMMARY]", {
+              callId,
+              event: "lifecycle_summary",
+              ...summary,
+              timestamp: new Date().toISOString(),
+            });
+
+            void recordCallDiagnostic(
+              "lifecycle_summary",
+              authoritativeCall.status === "failed"
+                ? "warning"
+                : "info",
+              summary
+            );
+          }
+
+          cleanupMedia();
+
+          endNativeCall(
+            callId,
+            authoritativeCall.status === "missed"
+              ? CALLKIT_END_REASONS.MISSED
+              : authoritativeCall.status === "failed"
+                ? CALLKIT_END_REASONS.FAILED
+                : authoritativeCall.status === "declined"
+                  ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
+                  : CALLKIT_END_REASONS.REMOTE_ENDED
+          );
+
+          setConnectionLabel(
+            terminalCallLabel(
+              authoritativeCall.status,
+              authoritativeCall.end_reason
+            )
+          );
+
+          console.log("[CALL RECONCILE]", {
+            callId,
+            event: "terminal_cleanup_applied",
+            status: authoritativeCall.status,
+            endReason: authoritativeCall.end_reason ?? null,
+            timestamp: new Date().toISOString(),
+          });
+
+          void recordCallDiagnostic(
+            "lifecycle_resumed_terminal",
+            "info",
+            {
+              previousLifecycleState,
+              backgroundDurationMs,
+              status: authoritativeCall.status,
+              endReason:
+                authoritativeCall.end_reason ?? null,
+            }
+          );
+
+          if (terminalNavigationTimerRef.current) {
+            clearTimeout(terminalNavigationTimerRef.current);
+          }
+
+          terminalNavigationTimerRef.current = setTimeout(() => {
+            terminalNavigationTimerRef.current = null;
+            closeCallScreen();
+          }, 650);
+
+          return;
+        }
+
+        // If the call is still active, resume normal candidate/answer sync.
+        await syncRemoteCandidates();
+
+        if (
+          authoritativeCall.status === "accepted" &&
+          authoritativeCall.answer &&
+          authoritativeCall.caller_id === user?.id
+        ) {
+          await applyRemoteAnswer(
+            authoritativeCall.answer as Record<string, unknown>
+          );
+        }
+
+        if (authoritativeCall.status !== "accepted") {
+          return;
+        }
+
+        const peer = peerRef.current;
+        const peerState =
+          peer?.connectionState ?? "closed";
+        const iceState =
+          peer?.iceConnectionState ?? "closed";
+
+        const networkHealthy =
+          lastNetworkConnectedRef.current !== false &&
+          lastNetworkReachableRef.current !== false;
+
+        const peerHealthy =
+          peerState === "connected" &&
+          (
+            iceState === "connected" ||
+            iceState === "completed"
+          );
+
+        if (networkHealthy && peerHealthy) {
+          console.log("[CALL LIFECYCLE]", {
+            callId,
+            event: "resumed_connected",
+            backgroundDurationMs,
+            peerConnectionState: peerState,
+            iceConnectionState: iceState,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+            timestamp: new Date().toISOString(),
+          });
+
+          void recordCallDiagnostic(
+            "lifecycle_resumed_connected",
+            "info",
+            {
+              backgroundDurationMs,
+              peerConnectionState: peerState,
+              iceConnectionState: iceState,
+              networkType:
+                lastNetworkTypeRef.current ?? "unknown",
+            }
+          );
+
+          if (lifecycleAudioRestoreTimerRef.current) {
+            clearTimeout(
+              lifecycleAudioRestoreTimerRef.current
+            );
+          }
+
+          lifecycleAudioRestoreTimerRef.current =
+            setTimeout(() => {
+              lifecycleAudioRestoreTimerRef.current = null;
+
+              const activePeer = peerRef.current;
+
+              if (
+                callStatusRef.current !== "accepted" ||
+                !activePeer ||
+                activePeer.connectionState !== "connected" ||
+                !(
+                  activePeer.iceConnectionState === "connected" ||
+                  activePeer.iceConnectionState === "completed"
+                )
+              ) {
+                return;
+              }
+
+              try {
+                const mediaType =
+                  authoritativeCall.call_type === "video"
+                    ? "video"
+                    : "audio";
+
+                InCallManager.start({
+                  media: mediaType,
+                  auto: true,
+                });
+                InCallManager.setKeepScreenOn(true);
+                InCallManager.setForceSpeakerphoneOn(
+                  speakerOnRef.current
+                );
+
+                if (!remoteOnHold) {
+                  remoteStreamRef.current
+                    ?.getAudioTracks()
+                    .forEach((track) => {
+                      track.enabled = true;
+                    });
+                }
+
+                lifecycleSummaryRef.current.unlockAudioRestoreCount += 1;
+
+                console.log("[CALL LOCK]", {
+                  callId,
+                  event: "unlock_audio_route_restored",
+                  backgroundDurationMs,
+                  media: mediaType,
+                  speakerOn: speakerOnRef.current,
+                  remoteAudioTracks:
+                    remoteStreamRef.current
+                      ?.getAudioTracks().length ?? 0,
+                  timestamp: new Date().toISOString(),
+                });
+
+                void recordCallDiagnostic(
+                  "lifecycle_unlock_audio_restored",
+                  "info",
+                  {
+                    backgroundDurationMs,
+                    media: mediaType,
+                    speakerOn: speakerOnRef.current,
+                    remoteAudioTracks:
+                      remoteStreamRef.current
+                        ?.getAudioTracks().length ?? 0,
+                  }
+                );
+              } catch (error) {
+                console.warn("[CALL LOCK]", {
+                  callId,
+                  event: "unlock_audio_route_restore_failed",
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : String(error),
+                  timestamp: new Date().toISOString(),
+                });
+
+                void recordCallDiagnostic(
+                  "lifecycle_unlock_audio_restore_failed",
+                  "warning",
+                  {
+                    backgroundDurationMs,
+                    error:
+                      error instanceof Error
+                        ? error.message
+                        : String(error),
+                  }
+                );
+              }
+            }, 350);
+
+          if (
+            suspensionGapMs !== null &&
+            suspensionGapMs >= JS_SUSPENSION_GAP_MS
+          ) {
+            if (postSuspensionVerifyTimerRef.current) {
+              clearTimeout(
+                postSuspensionVerifyTimerRef.current
+              );
+            }
+
+            postSuspensionVerifyTimerRef.current =
+              setTimeout(() => {
+                postSuspensionVerifyTimerRef.current = null;
+
+                void (async () => {
+                  await syncRemoteCandidates();
+
+                  const resumedPeer = peerRef.current;
+                  const resumedPeerState =
+                    resumedPeer?.connectionState ?? "closed";
+                  const resumedIceState =
+                    resumedPeer?.iceConnectionState ?? "closed";
+
+                  const resumedNetworkHealthy =
+                    lastNetworkConnectedRef.current !== false &&
+                    lastNetworkReachableRef.current !== false;
+
+                  const resumedPeerHealthy =
+                    resumedPeerState === "connected" &&
+                    (
+                      resumedIceState === "connected" ||
+                      resumedIceState === "completed"
+                    );
+
+                  if (
+                    callStatusRef.current === "accepted" &&
+                    resumedNetworkHealthy &&
+                    resumedPeerHealthy
+                  ) {
+                    console.log("[CALL SUSPENSION]", {
+                      callId,
+                      event: "js_suspension_recovered",
+                      suspensionGapMs,
+                      backgroundDurationMs,
+                      peerConnectionState:
+                        resumedPeerState,
+                      iceConnectionState:
+                        resumedIceState,
+                      networkType:
+                        lastNetworkTypeRef.current ?? "unknown",
+                      timestamp: new Date().toISOString(),
+                    });
+
+                    void recordCallDiagnostic(
+                      "js_suspension_recovered",
+                      "info",
+                      {
+                        suspensionGapMs,
+                        backgroundDurationMs,
+                        peerConnectionState:
+                          resumedPeerState,
+                        iceConnectionState:
+                          resumedIceState,
+                        networkType:
+                          lastNetworkTypeRef.current ?? "unknown",
+                      }
+                    );
+
+                    return;
+                  }
+
+                  if (callStatusRef.current !== "accepted") {
+                    return;
+                  }
+
+                  lifecycleSummaryRef.current.recoveryRequiredCount += 1;
+
+                  console.warn("[CALL SUSPENSION]", {
+                    callId,
+                    event: "js_suspension_recovery_required",
+                    suspensionGapMs,
+                    backgroundDurationMs,
+                    peerConnectionState:
+                      resumedPeerState,
+                    iceConnectionState:
+                      resumedIceState,
+                    networkType:
+                      lastNetworkTypeRef.current ?? "unknown",
+                    isConnected:
+                      lastNetworkConnectedRef.current,
+                    isInternetReachable:
+                      lastNetworkReachableRef.current,
+                    timestamp: new Date().toISOString(),
+                  });
+
+                  void recordCallDiagnostic(
+                    "js_suspension_recovery_required",
+                    "warning",
+                    {
+                      suspensionGapMs,
+                      backgroundDurationMs,
+                      peerConnectionState:
+                        resumedPeerState,
+                      iceConnectionState:
+                        resumedIceState,
+                      networkType:
+                        lastNetworkTypeRef.current ?? "unknown",
+                      isConnected:
+                        lastNetworkConnectedRef.current,
+                      isInternetReachable:
+                        lastNetworkReachableRef.current,
+                    }
+                  );
+
+                  needsAudioRecoveryRef.current = true;
+                  setConnectionLabel("Reconnecting…");
+
+                  const resumedPeerDegraded =
+                    resumedPeerState === "disconnected" ||
+                    resumedPeerState === "failed" ||
+                    resumedIceState === "disconnected" ||
+                    resumedIceState === "failed";
+
+                  if (
+                    resumedNetworkHealthy &&
+                    resumedPeerDegraded &&
+                    isCaller &&
+                    requestIceRestartRef.current
+                  ) {
+                    requestIceRestartRef.current();
+                  }
+                })();
+              }, POST_SUSPENSION_VERIFY_MS);
+          }
+
+          if (backgroundNetworkChanged) {
+            if (backgroundNetworkVerifyTimerRef.current) {
+              clearTimeout(
+                backgroundNetworkVerifyTimerRef.current
+              );
+            }
+
+            backgroundNetworkVerifyTimerRef.current =
+              setTimeout(() => {
+                backgroundNetworkVerifyTimerRef.current = null;
+
+                void (async () => {
+                  const latestNetwork =
+                    await Network.getNetworkStateAsync().catch(
+                      () => null
+                    );
+
+                  if (latestNetwork) {
+                    lastNetworkTypeRef.current = String(
+                      latestNetwork.type ?? "unknown"
+                    );
+                    lastNetworkConnectedRef.current =
+                      latestNetwork.isConnected ?? null;
+                    lastNetworkReachableRef.current =
+                      latestNetwork.isInternetReachable ?? null;
+                  }
+
+                  await syncRemoteCandidates();
+
+                  const activePeer = peerRef.current;
+                  const activePeerState =
+                    activePeer?.connectionState ?? "closed";
+                  const activeIceState =
+                    activePeer?.iceConnectionState ?? "closed";
+
+                  const activeNetworkHealthy =
+                    lastNetworkConnectedRef.current !== false &&
+                    lastNetworkReachableRef.current !== false;
+
+                  const activePeerHealthy =
+                    activePeerState === "connected" &&
+                    (
+                      activeIceState === "connected" ||
+                      activeIceState === "completed"
+                    );
+
+                  if (
+                    callStatusRef.current === "accepted" &&
+                    activeNetworkHealthy &&
+                    activePeerHealthy
+                  ) {
+                    console.log("[BACKGROUND NETWORK]", {
+                      callId,
+                      event: "background_network_change_survived",
+                      from: backgroundNetwork,
+                      to: {
+                        type:
+                          lastNetworkTypeRef.current ?? "unknown",
+                        isConnected:
+                          lastNetworkConnectedRef.current,
+                        isInternetReachable:
+                          lastNetworkReachableRef.current,
+                      },
+                      peerConnectionState:
+                        activePeerState,
+                      iceConnectionState:
+                        activeIceState,
+                      timestamp: new Date().toISOString(),
+                    });
+
+                    void recordCallDiagnostic(
+                      "background_network_change_survived",
+                      "info",
+                      {
+                        from: backgroundNetwork,
+                        to: {
+                          type:
+                            lastNetworkTypeRef.current ?? "unknown",
+                          isConnected:
+                            lastNetworkConnectedRef.current,
+                          isInternetReachable:
+                            lastNetworkReachableRef.current,
+                        },
+                        peerConnectionState:
+                          activePeerState,
+                        iceConnectionState:
+                          activeIceState,
+                        quality:
+                          lastQualitySnapshotRef.current,
+                      }
+                    );
+
+                    return;
+                  }
+
+                  if (callStatusRef.current !== "accepted") {
+                    return;
+                  }
+
+                  lifecycleSummaryRef.current.recoveryRequiredCount += 1;
+
+                  console.warn("[BACKGROUND NETWORK]", {
+                    callId,
+                    event: "background_network_change_recovery_required",
+                    from: backgroundNetwork,
+                    to: {
+                      type:
+                        lastNetworkTypeRef.current ?? "unknown",
+                      isConnected:
+                        lastNetworkConnectedRef.current,
+                      isInternetReachable:
+                        lastNetworkReachableRef.current,
+                    },
+                    peerConnectionState:
+                      activePeerState,
+                    iceConnectionState:
+                      activeIceState,
+                    timestamp: new Date().toISOString(),
+                  });
+
+                  void recordCallDiagnostic(
+                    "background_network_change_recovery_required",
+                    "warning",
+                    {
+                      from: backgroundNetwork,
+                      to: {
+                        type:
+                          lastNetworkTypeRef.current ?? "unknown",
+                        isConnected:
+                          lastNetworkConnectedRef.current,
+                        isInternetReachable:
+                          lastNetworkReachableRef.current,
+                      },
+                      peerConnectionState:
+                        activePeerState,
+                      iceConnectionState:
+                        activeIceState,
+                    }
+                  );
+
+                  needsAudioRecoveryRef.current = true;
+                  setConnectionLabel("Reconnecting…");
+
+                  const activePeerDegraded =
+                    activePeerState === "disconnected" ||
+                    activePeerState === "failed" ||
+                    activeIceState === "disconnected" ||
+                    activeIceState === "failed";
+
+                  if (
+                    activeNetworkHealthy &&
+                    activePeerDegraded &&
+                    isCaller &&
+                    requestIceRestartRef.current
+                  ) {
+                    requestIceRestartRef.current();
+                  }
+                })();
+              }, BACKGROUND_NETWORK_VERIFY_MS);
+          }
+
+          return;
+        }
+
+        lifecycleSummaryRef.current.recoveryRequiredCount += 1;
+
+        console.warn("[CALL LIFECYCLE]", {
+          callId,
+          event: "resumed_recovery_required",
+          backgroundDurationMs,
+          peerConnectionState: peerState,
+          iceConnectionState: iceState,
+          networkType:
+            lastNetworkTypeRef.current ?? "unknown",
+          isConnected:
+            lastNetworkConnectedRef.current,
+          isInternetReachable:
+            lastNetworkReachableRef.current,
+          timestamp: new Date().toISOString(),
+        });
+
+        void recordCallDiagnostic(
+          "lifecycle_resumed_recovery_required",
+          "warning",
+          {
+            backgroundDurationMs,
+            peerConnectionState: peerState,
+            iceConnectionState: iceState,
+            networkType:
+              lastNetworkTypeRef.current ?? "unknown",
+            isConnected:
+              lastNetworkConnectedRef.current,
+            isInternetReachable:
+              lastNetworkReachableRef.current,
+          }
+        );
+
+        setConnectionLabel("Reconnecting…");
+        needsAudioRecoveryRef.current = true;
+
+        // Recovery is evidence-driven: only ask for an ICE restart when
+        // network is available AND WebRTC is actually degraded.
+        const peerDegraded =
+          peerState === "disconnected" ||
+          peerState === "failed" ||
+          iceState === "disconnected" ||
+          iceState === "failed";
+
+        if (
+          networkHealthy &&
+          peerDegraded &&
+          isCaller &&
+          requestIceRestartRef.current
+        ) {
+          requestIceRestartRef.current();
+        }
+      } finally {
+        resumeReconcileInFlight = false;
+      }
+    };
+
+    const subscription = AppState.addEventListener(
+      "change",
+      (nextState) => {
+        const previousState =
+          lifecycleStateRef.current;
+
+        lifecycleStateRef.current = nextState;
+
+        if (
+          previousState === nextState
+        ) {
+          return;
+        }
+
+        if (
+          nextState === "background" ||
+          nextState === "inactive"
+        ) {
+          if (backgroundedAtRef.current === null) {
+            backgroundedAtRef.current = Date.now();
+
+            lifecycleSummaryRef.current.backgroundCount += 1;
+            lifecycleSummaryRef.current.firstBackgroundAt ??=
+              new Date().toISOString();
+
+            backgroundNetworkSnapshotRef.current = {
+              type: lastNetworkTypeRef.current,
+              isConnected:
+                lastNetworkConnectedRef.current,
+              isInternetReachable:
+                lastNetworkReachableRef.current,
+            };
+          }
+
+          if (callStatusRef.current === "accepted") {
+            console.log("[CALL LIFECYCLE]", {
+              callId,
+              event: "backgrounded",
+              from: previousState,
+              to: nextState,
+              peerConnectionState:
+                peerRef.current?.connectionState ?? null,
+              iceConnectionState:
+                peerRef.current?.iceConnectionState ?? null,
+              networkType:
+                lastNetworkTypeRef.current ?? "unknown",
+              networkSnapshot:
+                backgroundNetworkSnapshotRef.current,
+              timestamp: new Date().toISOString(),
+            });
+
+            void recordCallDiagnostic(
+              "lifecycle_backgrounded",
+              "info",
+              {
+                from: previousState,
+                to: nextState,
+                peerConnectionState:
+                  peerRef.current?.connectionState ?? null,
+                iceConnectionState:
+                  peerRef.current?.iceConnectionState ?? null,
+                networkType:
+                  lastNetworkTypeRef.current ?? "unknown",
+              }
+            );
+
+            console.log("[CALL LOCK]", {
+              callId,
+              event: "lock_or_background_entered",
+              from: previousState,
+              to: nextState,
+              peerConnectionState:
+                peerRef.current?.connectionState ?? null,
+              iceConnectionState:
+                peerRef.current?.iceConnectionState ?? null,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          // Important: do not stop media, do not mutate the call row, and do
+          // not request ICE recovery simply because the app backgrounded.
+          return;
+        }
+
+        if (nextState === "active") {
+          const now = Date.now();
+          const backgroundDurationMs =
+            backgroundedAtRef.current === null
+              ? null
+              : now -
+                backgroundedAtRef.current;
+
+          const suspensionGapMs = Math.max(
+            0,
+            now - lastJsHeartbeatAtRef.current
+          );
+
+          lastJsHeartbeatAtRef.current = now;
+
+          lifecycleSummaryRef.current.resumeCount += 1;
+          lifecycleSummaryRef.current.lastResumeAt =
+            new Date().toISOString();
+
+          if (backgroundDurationMs !== null) {
+            lifecycleSummaryRef.current.totalBackgroundMs +=
+              backgroundDurationMs;
+            lifecycleSummaryRef.current.longestBackgroundMs =
+              Math.max(
+                lifecycleSummaryRef.current.longestBackgroundMs,
+                backgroundDurationMs
+              );
+          }
+
+          const backgroundNetwork =
+            backgroundNetworkSnapshotRef.current;
+
+          backgroundedAtRef.current = null;
+          backgroundNetworkSnapshotRef.current = null;
+
+          if (
+            callStatusRef.current === "accepted" &&
+            suspensionGapMs >= JS_SUSPENSION_GAP_MS
+          ) {
+            lifecycleSummaryRef.current.jsSuspensionCount += 1;
+
+            console.warn("[CALL SUSPENSION]", {
+              callId,
+              event: "js_suspension_detected",
+              suspensionGapMs,
+              backgroundDurationMs,
+              from: previousState,
+              peerConnectionState:
+                peerRef.current?.connectionState ?? null,
+              iceConnectionState:
+                peerRef.current?.iceConnectionState ?? null,
+              timestamp: new Date().toISOString(),
+            });
+
+            void recordCallDiagnostic(
+              "js_suspension_detected",
+              "warning",
+              {
+                suspensionGapMs,
+                backgroundDurationMs,
+                from: previousState,
+                peerConnectionState:
+                  peerRef.current?.connectionState ?? null,
+                iceConnectionState:
+                  peerRef.current?.iceConnectionState ?? null,
+              }
+            );
+          }
+
+          console.log("[CALL LIFECYCLE]", {
+            callId,
+            event: "resumed",
+            from: previousState,
+            backgroundDurationMs,
+            suspensionGapMs,
+            backgroundNetwork,
+            timestamp: new Date().toISOString(),
+          });
+
+          if (callStatusRef.current === "accepted") {
+            void recordCallDiagnostic(
+              "lifecycle_resumed",
+              "info",
+              {
+                from: previousState,
+                backgroundDurationMs,
+                suspensionGapMs,
+                backgroundNetwork,
+              }
+            );
+          }
+
+          void reconcileOnResume(
+            previousState,
+            backgroundDurationMs,
+            suspensionGapMs,
+            backgroundNetwork
+          );
+        }
       }
     );
 
     return () => subscription.remove();
   }, [
+    applyRemoteAnswer,
     callId,
+    cleanupMedia,
+    isCaller,
+    recordCallDiagnostic,
+    remoteOnHold,
     syncRemoteCandidates,
+    user?.id,
   ]);
 
   useEffect(() => {
@@ -1110,41 +4184,190 @@ export default function CallScreen() {
 
     let previousLost = 0;
     let previousReceived = 0;
+    let previousBytesReceived = 0;
+    let previousBytesSent = 0;
+    let previousSampleAt = Date.now();
+    let previousPairId: string | null = null;
 
     const updateQuality = async () => {
       try {
-        const reports =
-          await peerRef.current?.getStats();
+        const peer = peerRef.current;
+
+        if (
+          !peer ||
+          peer.connectionState === "closed" ||
+          isTerminalCallStatus(callStatusRef.current ?? "")
+        ) {
+          return;
+        }
+
+        const stats: any = await peer.getStats();
+        const reports: any[] = [];
+
+        if (typeof stats?.forEach === "function") {
+          stats.forEach((report: any) =>
+            reports.push(report)
+          );
+        } else if (Array.isArray(stats)) {
+          reports.push(...stats);
+        }
+
+        const byId = new Map<string, any>();
+
+        for (const report of reports) {
+          if (report?.id) {
+            byId.set(report.id, report);
+          }
+        }
 
         let lost = 0;
         let received = 0;
-        let jitter = 0;
-        let roundTripTime = 0;
+        let sent = 0;
+        let jitterSeconds = 0;
+        let inboundAudioPackets = 0;
+        let inboundVideoPackets = 0;
+        let outboundAudioPackets = 0;
+        let outboundVideoPackets = 0;
 
-        reports?.forEach((report: any) => {
+        for (const report of reports) {
           if (
-            report.type === "inbound-rtp" &&
-            !report.isRemote
+            report?.type === "inbound-rtp" &&
+            !report?.isRemote
           ) {
-            lost += report.packetsLost ?? 0;
-            received += report.packetsReceived ?? 0;
-            jitter = Math.max(
-              jitter,
-              report.jitter ?? 0
+            const packetsReceived =
+              Number(report.packetsReceived ?? 0);
+
+            lost += Number(report.packetsLost ?? 0);
+            received += packetsReceived;
+            jitterSeconds = Math.max(
+              jitterSeconds,
+              Number(report.jitter ?? 0)
             );
+
+            if (report.kind === "audio" ||
+                report.mediaType === "audio") {
+              inboundAudioPackets += packetsReceived;
+            }
+
+            if (report.kind === "video" ||
+                report.mediaType === "video") {
+              inboundVideoPackets += packetsReceived;
+            }
           }
 
           if (
-            report.type ===
-            "candidate-pair" &&
-            report.state === "succeeded"
+            report?.type === "outbound-rtp" &&
+            !report?.isRemote
           ) {
-            roundTripTime = Math.max(
-              roundTripTime,
-              report.currentRoundTripTime ?? 0
+            const packetsSent =
+              Number(report.packetsSent ?? 0);
+
+            sent += packetsSent;
+
+            if (report.kind === "audio" ||
+                report.mediaType === "audio") {
+              outboundAudioPackets += packetsSent;
+            }
+
+            if (report.kind === "video" ||
+                report.mediaType === "video") {
+              outboundVideoPackets += packetsSent;
+            }
+          }
+        }
+
+        let selectedPair: any = reports.find(
+          (report) =>
+            report?.type === "candidate-pair" &&
+            report?.selected === true
+        );
+
+        if (!selectedPair) {
+          const transport = reports.find(
+            (report) =>
+              report?.type === "transport" &&
+              report?.selectedCandidatePairId
+          );
+
+          if (transport?.selectedCandidatePairId) {
+            selectedPair = byId.get(
+              transport.selectedCandidatePairId
             );
           }
-        });
+        }
+
+        if (!selectedPair) {
+          selectedPair = reports.find(
+            (report) =>
+              report?.type === "candidate-pair" &&
+              report?.state === "succeeded" &&
+              report?.nominated === true
+          );
+        }
+
+        if (!selectedPair) {
+          selectedPair = reports.find(
+            (report) =>
+              report?.type === "candidate-pair" &&
+              report?.state === "succeeded"
+          );
+        }
+
+        const localCandidate =
+          selectedPair?.localCandidateId
+            ? byId.get(selectedPair.localCandidateId)
+            : null;
+
+        const remoteCandidate =
+          selectedPair?.remoteCandidateId
+            ? byId.get(selectedPair.remoteCandidateId)
+            : null;
+
+        const pairId =
+          selectedPair?.id ?? null;
+
+        const now = Date.now();
+        const elapsedMs = Math.max(
+          1,
+          now - previousSampleAt
+        );
+
+        const bytesReceived = Number(
+          selectedPair?.bytesReceived ?? 0
+        );
+        const bytesSent = Number(
+          selectedPair?.bytesSent ?? 0
+        );
+
+        // A candidate-pair switch resets byte counters. Do not interpret
+        // that reset as zero/negative bitrate.
+        const pairChanged =
+          previousPairId !== null &&
+          pairId !== previousPairId;
+
+        const inboundBitrateKbps =
+          !pairChanged &&
+          previousBytesReceived > 0 &&
+          bytesReceived >= previousBytesReceived
+            ? Math.round(
+                ((bytesReceived -
+                  previousBytesReceived) *
+                  8) /
+                  elapsedMs
+              )
+            : null;
+
+        const outboundBitrateKbps =
+          !pairChanged &&
+          previousBytesSent > 0 &&
+          bytesSent >= previousBytesSent
+            ? Math.round(
+                ((bytesSent -
+                  previousBytesSent) *
+                  8) /
+                  elapsedMs
+              )
+            : null;
 
         const lostDelta = Math.max(
           0,
@@ -1154,43 +4377,157 @@ export default function CallScreen() {
           0,
           received - previousReceived
         );
-        const total = lostDelta + receivedDelta;
+        const packetTotal =
+          lostDelta + receivedDelta;
+
         const lossRate =
-          total > 0 ? lostDelta / total : 0;
+          packetTotal > 0
+            ? lostDelta / packetTotal
+            : 0;
+
+        const roundTripTimeSeconds =
+          Number(
+            selectedPair?.currentRoundTripTime ?? 0
+          );
+
+        const quality =
+          lossRate > 0.08 ||
+          jitterSeconds > 0.08 ||
+          roundTripTimeSeconds > 0.6
+            ? "Poor"
+            : lossRate > 0.025 ||
+                jitterSeconds > 0.035 ||
+                roundTripTimeSeconds > 0.3
+              ? "Good"
+              : "Excellent";
+
+        setNetworkQuality(quality);
+
+        const qualitySnapshot = {
+          quality,
+          networkType:
+            lastNetworkTypeRef.current ?? "unknown",
+          rttMs: Math.round(
+            roundTripTimeSeconds * 1000
+          ),
+          jitterMs: Math.round(
+            jitterSeconds * 1000
+          ),
+          packetLossPct: Number(
+            (lossRate * 100).toFixed(2)
+          ),
+          inboundBitrateKbps,
+          outboundBitrateKbps,
+          packetsReceived: received,
+          packetsSent: sent,
+          localCandidateType:
+            localCandidate?.candidateType ?? null,
+          remoteCandidateType:
+            remoteCandidate?.candidateType ?? null,
+          localProtocol:
+            localCandidate?.protocol ?? null,
+          remoteProtocol:
+            remoteCandidate?.protocol ?? null,
+          usingRelay:
+            localCandidate?.candidateType === "relay" ||
+            remoteCandidate?.candidateType === "relay",
+          peerConnectionState:
+            peer.connectionState,
+          iceConnectionState:
+            peer.iceConnectionState,
+        };
+
+        lastQualitySnapshotRef.current =
+          qualitySnapshot;
+
+        console.log("[CALL QUALITY]", {
+          callId,
+          event: "quality_sample",
+          quality,
+          networkType:
+            lastNetworkTypeRef.current ?? "unknown",
+          isConnected:
+            lastNetworkConnectedRef.current,
+          isInternetReachable:
+            lastNetworkReachableRef.current,
+          rttMs: Math.round(
+            roundTripTimeSeconds * 1000
+          ),
+          jitterMs: Math.round(
+            jitterSeconds * 1000
+          ),
+          packetLossPct: Number(
+            (lossRate * 100).toFixed(2)
+          ),
+          inboundBitrateKbps,
+          outboundBitrateKbps,
+          packetsReceived: received,
+          packetsSent: sent,
+          inboundAudioPackets,
+          inboundVideoPackets,
+          outboundAudioPackets,
+          outboundVideoPackets,
+          ice: {
+            localCandidateType:
+              localCandidate?.candidateType ?? null,
+            remoteCandidateType:
+              remoteCandidate?.candidateType ?? null,
+            localProtocol:
+              localCandidate?.protocol ?? null,
+            remoteProtocol:
+              remoteCandidate?.protocol ?? null,
+            usingRelay:
+              localCandidate?.candidateType === "relay" ||
+              remoteCandidate?.candidateType === "relay",
+          },
+          peerConnectionState:
+            peer.connectionState,
+          iceConnectionState:
+            peer.iceConnectionState,
+          timestamp: new Date().toISOString(),
+        });
 
         previousLost = lost;
         previousReceived = received;
-
-        if (
-          lossRate > 0.08 ||
-          jitter > 0.08 ||
-          roundTripTime > 0.6
-        ) {
-          setNetworkQuality("Poor");
-        } else if (
-          lossRate > 0.025 ||
-          jitter > 0.035 ||
-          roundTripTime > 0.3
-        ) {
-          setNetworkQuality("Good");
-        } else {
-          setNetworkQuality("Excellent");
-        }
-      } catch {
+        previousBytesReceived = bytesReceived;
+        previousBytesSent = bytesSent;
+        previousSampleAt = now;
+        previousPairId = pairId;
+      } catch (error) {
         setNetworkQuality("Unknown");
+
+        console.warn("[CALL QUALITY]", {
+          callId,
+          event: "quality_sample_failed",
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+          timestamp: new Date().toISOString(),
+        });
       }
     };
 
     void updateQuality();
+
     const timer = setInterval(
       updateQuality,
       4000
     );
 
     return () => clearInterval(timer);
-  }, [call?.status]);
+  }, [call?.status, callId]);
 
-  useEffect(() => cleanupMedia, [cleanupMedia]);
+  useEffect(() => {
+    return () => {
+      if (terminalNavigationTimerRef.current) {
+        clearTimeout(terminalNavigationTimerRef.current);
+        terminalNavigationTimerRef.current = null;
+      }
+
+      cleanupMedia();
+    };
+  }, [cleanupMedia]);
 
   useEffect(() => {
     if (!isVideoCall) {
@@ -1214,9 +4551,9 @@ export default function CallScreen() {
           videoSender.getParameters();
 
         parameters.encodings =
-          parameters.encodings?.length
+          (parameters.encodings?.length
             ? parameters.encodings
-            : [{}];
+            : [{}]) as any;
 
         parameters.encodings[0].maxBitrate =
           networkQuality === "Poor"
@@ -1239,13 +4576,83 @@ export default function CallScreen() {
     void applyQuality();
   }, [isVideoCall, networkQuality]);
 
+  useEffect(() => {
+    if (call?.status !== "accepted") {
+      return;
+    }
+
+    // Hold pauses outgoing media without changing the user's mute/camera
+    // preferences. Resume restores those preferences automatically.
+    localStreamRef.current
+      ?.getAudioTracks()
+      .forEach((track) => {
+        track.enabled = !localOnHold && !muted;
+      });
+
+    localStreamRef.current
+      ?.getVideoTracks()
+      .forEach((track) => {
+        track.enabled = !localOnHold && cameraEnabled;
+      });
+  }, [call?.status, cameraEnabled, localOnHold, muted]);
+
+  const toggleHold = useCallback(async () => {
+    if (!callId || !call || call.status !== "accepted" || holdUpdating) {
+      return;
+    }
+
+    const next = !localOnHold;
+    const holdColumn = isCaller ? "caller_on_hold" : "callee_on_hold";
+
+    setHoldUpdating(true);
+
+    try {
+      const { data, error } = await supabase
+        .from("calls")
+        .update({ [holdColumn]: next })
+        .eq("id", callId)
+        .eq("status", "accepted")
+        .select("id, caller_on_hold, callee_on_hold, status")
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data) {
+        setConnectionLabel("Call no longer active");
+        return;
+      }
+
+      // Update immediately; Realtime will deliver the same state to both sides.
+      setCall((current) =>
+        current
+          ? {
+              ...current,
+              caller_on_hold: Boolean(data.caller_on_hold),
+              callee_on_hold: Boolean(data.callee_on_hold),
+            }
+          : current
+      );
+    } catch (error) {
+      Alert.alert(
+        "Hold unavailable",
+        error instanceof Error
+          ? error.message
+          : "Could not update the hold state."
+      );
+    } finally {
+      setHoldUpdating(false);
+    }
+  }, [call, callId, holdUpdating, isCaller, localOnHold]);
+
   function toggleMute() {
     const next = !muted;
 
     localStreamRef.current
       ?.getAudioTracks()
       .forEach((track) => {
-        track.enabled = !next;
+        track.enabled = !next && !localOnHold;
       });
 
     setMuted(next);
@@ -1254,11 +4661,14 @@ export default function CallScreen() {
     }
   }
 
-  function toggleSpeaker() {
+  const toggleSpeaker = useCallback(() => {
     const next = !speakerOn;
+
+    // Force the in-call audio route immediately, then mirror that state in UI.
+    // This does not touch WebRTC tracks, mute, hold, or the call lifecycle.
     InCallManager.setForceSpeakerphoneOn(next);
     setSpeakerOn(next);
-  }
+  }, [speakerOn]);
 
   function toggleCamera() {
     const next = !cameraEnabled;
@@ -1266,10 +4676,11 @@ export default function CallScreen() {
     localStreamRef.current
       ?.getVideoTracks()
       .forEach((track) => {
-        track.enabled = next;
+        track.enabled = next && !localOnHold;
       });
 
     setCameraEnabled(next);
+    cameraEnabledRef.current = next;
 
     if (user && callChannelRef.current) {
       void callChannelRef.current.send({
@@ -1322,6 +4733,39 @@ export default function CallScreen() {
     "Global Qall User";
   const incomingWaiting =
     isIncoming && call.status === "ringing";
+  const remoteVideoVisible = Boolean(
+    remoteStream &&
+    remoteVideoAvailable &&
+    !remoteOnHold
+  );
+  const remoteVideoStatus =
+    remoteOnHold
+      ? `${otherName} is on hold`
+      : call.status === "accepted"
+        ? "Camera is off"
+        : connectionLabel;
+
+  const qualityIndicator =
+    call.status === "accepted" &&
+    (
+      connectionLabel.startsWith("Reconnecting") ||
+      peerConnectionState === "disconnected" ||
+      iceConnectionState === "disconnected" ||
+      iceConnectionState === "failed"
+    )
+      ? "Reconnecting"
+      : networkQuality;
+
+  const qualityIcon =
+    qualityIndicator === "Reconnecting"
+      ? "sync"
+      : qualityIndicator === "Excellent"
+        ? "cellular"
+        : qualityIndicator === "Good"
+          ? "wifi"
+          : qualityIndicator === "Poor"
+            ? "warning"
+            : "help-circle-outline";
 
   return (
     <>
@@ -1330,10 +4774,9 @@ export default function CallScreen() {
       <SafeAreaView style={styles.safeArea}>
         {isVideoCall && !incomingWaiting ? (
           <View style={styles.videoStage}>
-            {remoteStream &&
-            remoteVideoAvailable ? (
+            {remoteVideoVisible ? (
               <RTCView
-                streamURL={remoteStream.toURL()}
+                streamURL={remoteStream!.toURL()}
                 style={styles.remoteVideo}
                 objectFit="cover"
                 mirror={false}
@@ -1352,14 +4795,12 @@ export default function CallScreen() {
                 <Text style={styles.videoWaitingStatus}>
                   {incomingWaiting
                     ? "Incoming video call"
-                    : call.status === "accepted"
-                      ? "Camera is off"
-                      : connectionLabel}
+                    : remoteVideoStatus}
                 </Text>
               </View>
             )}
 
-            {localStream && cameraEnabled && (
+            {localStream && cameraEnabled && !localOnHold && (
               <Animated.View
                 {...previewPanResponder.panHandlers}
                 style={[
@@ -1389,11 +4830,57 @@ export default function CallScreen() {
               </Text>
               <Text style={styles.videoStatus}>
                 {call.status === "accepted"
-                  ? `${formatDuration(
-                      elapsedSeconds
-                    )} · ${networkQuality}`
+                  ? remoteOnHold
+                    ? `${otherName} is on hold`
+                    : localOnHold
+                      ? "Call on hold"
+                      : formatDuration(
+                          elapsedSeconds
+                        )
                   : connectionLabel}
               </Text>
+
+              {call.status === "accepted" &&
+                !localOnHold &&
+                !remoteOnHold && (
+                  <View style={styles.qualityIndicator}>
+                    <Ionicons
+                      name={qualityIcon as any}
+                      size={14}
+                      color="#FFFFFF"
+                    />
+                    <Text style={styles.qualityIndicatorText}>
+                      {qualityIndicator === "Reconnecting"
+                        ? "Reconnecting…"
+                        : qualityIndicator}
+                    </Text>
+                  </View>
+                )}
+
+              {call.status === "accepted" && (
+                <Pressable
+                  onPress={() => void toggleHold()}
+                  disabled={holdUpdating}
+                  style={[
+                    styles.holdPill,
+                    localOnHold && styles.holdPillActive,
+                    holdUpdating && styles.disabled,
+                  ]}
+                >
+                  <Ionicons
+                    name={localOnHold ? "play" : "pause"}
+                    size={15}
+                    color="#FFFFFF"
+                  />
+                  <Text style={styles.holdPillText}>
+                    {holdUpdating
+                      ? "Updating…"
+                      : localOnHold
+                        ? "Resume"
+                        : "Hold"}
+                  </Text>
+                </Pressable>
+              )}
             </View>
           </View>
         ) : (
@@ -1403,7 +4890,11 @@ export default function CallScreen() {
                 ? isVideoCall
                   ? "Incoming video call"
                   : "Incoming voice call"
-                : connectionLabel}
+                : call.status === "accepted" && remoteOnHold
+                  ? `${otherName} is on hold`
+                  : call.status === "accepted" && localOnHold
+                    ? "Call on hold"
+                    : connectionLabel}
             </Text>
 
             <UserAvatar
@@ -1422,9 +4913,55 @@ export default function CallScreen() {
             </Text>
 
             {call.status === "accepted" && (
-              <Text style={styles.duration}>
-                {formatDuration(elapsedSeconds)}
-              </Text>
+              <>
+                <Text style={styles.duration}>
+                  {formatDuration(elapsedSeconds)}
+                </Text>
+
+                {!localOnHold && !remoteOnHold && (
+                  <View
+                    style={[
+                      styles.qualityIndicator,
+                      styles.voiceQualityIndicator,
+                    ]}
+                  >
+                    <Ionicons
+                      name={qualityIcon as any}
+                      size={14}
+                      color="#FFFFFF"
+                    />
+                    <Text style={styles.qualityIndicatorText}>
+                      {qualityIndicator === "Reconnecting"
+                        ? "Reconnecting…"
+                        : qualityIndicator}
+                    </Text>
+                  </View>
+                )}
+
+                <Pressable
+                  onPress={() => void toggleHold()}
+                  disabled={holdUpdating}
+                  style={[
+                    styles.holdPill,
+                    styles.voiceHoldPill,
+                    localOnHold && styles.holdPillActive,
+                    holdUpdating && styles.disabled,
+                  ]}
+                >
+                  <Ionicons
+                    name={localOnHold ? "play" : "pause"}
+                    size={15}
+                    color="#FFFFFF"
+                  />
+                  <Text style={styles.holdPillText}>
+                    {holdUpdating
+                      ? "Updating…"
+                      : localOnHold
+                        ? "Resume"
+                        : "Hold"}
+                  </Text>
+                </Pressable>
+              </>
             )}
           </View>
         )}
@@ -1528,7 +5065,7 @@ export default function CallScreen() {
                     color="#FFFFFF"
                   />
                   <Text style={styles.controlLabel}>
-                    Camera
+                    {cameraEnabled ? "Video Off" : "Video On"}
                   </Text>
                 </Pressable>
 
@@ -1566,7 +5103,7 @@ export default function CallScreen() {
                 color="#FFFFFF"
               />
               <Text style={styles.controlLabel}>
-                Speaker
+                {speakerOn ? "Speaker" : "Earpiece"}
               </Text>
             </Pressable>
 
@@ -1614,6 +5151,12 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#C8DDD8",
   },
+  connectionDebug: {
+    marginTop: 6,
+    fontSize: 12,
+    color: "#AAB7B3",
+    textAlign: "center",
+  },
   name: {
     marginTop: 22,
     fontSize: 28,
@@ -1626,6 +5169,51 @@ const styles = StyleSheet.create({
     marginTop: 13,
     fontSize: 18,
     fontVariant: ["tabular-nums"],
+    color: "#FFFFFF",
+  },
+  qualityIndicator: {
+    marginTop: 7,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.28)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.18)",
+  },
+  voiceQualityIndicator: {
+    alignSelf: "center",
+    marginTop: 10,
+  },
+  qualityIndicatorText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#FFFFFF",
+  },
+  holdPill: {
+    marginTop: 10,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: 18,
+    backgroundColor: "rgba(255,255,255,0.18)",
+  },
+  voiceHoldPill: {
+    alignSelf: "center",
+    marginTop: 18,
+  },
+  holdPillActive: {
+    backgroundColor: "#B87916",
+  },
+  holdPillText: {
+    fontSize: 13,
+    fontWeight: "700",
     color: "#FFFFFF",
   },
   incomingActions: {

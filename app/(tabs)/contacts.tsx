@@ -17,9 +17,14 @@ import {
   View,
 } from "react-native";
 
+import { UserAvatar } from "../../components/UserAvatar";
 import { useAuth } from "../../contexts/AuthContext";
 import { supabase } from "../../lib/supabase";
-import { UserAvatar } from "../../components/UserAvatar";
+import {
+  createVideoCall,
+  createVoiceCall,
+  isUserBusyError,
+} from "../../lib/calling";
 
 type ContactProfile = {
   id: string;
@@ -353,23 +358,47 @@ export default function ContactsScreen() {
     }
   }
 
-  function openQall(contact: Contact) {
-    const contactQallId = contact.profile?.qall_id;
-
-    if (!contactQallId) {
+  async function startContactCall(
+    contact: Contact,
+    type: "voice" | "video"
+  ) {
+    if (!contact.contact_user_id) {
       Alert.alert(
-        "Qall ID unavailable",
-        "This contact's Qall ID could not be loaded."
+        "Call unavailable",
+        "This contact could not be loaded."
       );
       return;
     }
 
-    router.push({
-      pathname: "/qall",
-      params: {
-        qallId: contactQallId,
-      },
-    });
+    try {
+      const callId =
+        type === "video"
+          ? await createVideoCall(contact.contact_user_id)
+          : await createVoiceCall(contact.contact_user_id);
+
+      router.push({
+        pathname: "/call/[callId]",
+        params: {
+          callId,
+          direction: "outgoing",
+        },
+      });
+    } catch (error) {
+      if (isUserBusyError(error)) {
+        Alert.alert(
+          "User busy",
+          `${contact.contact_name} is already on another call.`
+        );
+        return;
+      }
+
+      Alert.alert(
+        "Call error",
+        error instanceof Error
+          ? error.message
+          : "Could not start the call."
+      );
+    }
   }
 
   async function openChat(contact: Contact) {
@@ -405,17 +434,6 @@ export default function ContactsScreen() {
     }
   }
 
-  function openContactProfile(contact: Contact) {
-    router.push({
-      pathname: "/contact/[userId]",
-      params: {
-        userId: contact.contact_user_id,
-        contactId: contact.id,
-        contactName: contact.contact_name,
-      },
-    });
-  }
-
   function renderContact({
     item,
   }: {
@@ -424,39 +442,25 @@ export default function ContactsScreen() {
     return (
       <View style={styles.contactCard}>
         <View style={styles.contactTopRow}>
-          <Pressable
-            onPress={() => openContactProfile(item)}
-            style={({ pressed }) => [
-              styles.contactProfileButton,
-              pressed && styles.pressed,
-            ]}
-          >
-            <UserAvatar
-              avatarUrl={item.profile?.avatar_url}
-              name={
-                item.profile?.display_name ??
-                item.contact_name
-              }
-              size={48}
-            />
+          <UserAvatar
+            avatarUrl={item.profile?.avatar_url}
+            name={
+              item.contact_name ||
+              item.profile?.display_name ||
+              "Global Qall User"
+            }
+            size={48}
+          />
 
-            <View style={styles.contactDetails}>
-              <Text style={styles.contactName}>
-                {item.contact_name}
-              </Text>
+          <View style={styles.contactDetails}>
+            <Text style={styles.contactName}>
+              {item.contact_name}
+            </Text>
 
-              <Text style={styles.contactQallId}>
-                {item.profile?.qall_id ??
-                  "Qall ID unavailable"}
-              </Text>
-            </View>
-
-            <Ionicons
-              name="chevron-forward"
-              size={20}
-              color="#9AA5A1"
-            />
-          </Pressable>
+            <Text style={styles.contactQallId}>
+              {item.profile?.qall_id ?? "Qall ID unavailable"}
+            </Text>
+          </View>
 
           <Pressable
             onPress={() => confirmDelete(item)}
@@ -493,7 +497,7 @@ export default function ContactsScreen() {
           </Pressable>
 
           <Pressable
-            onPress={() => openQall(item)}
+            onPress={() => void startContactCall(item, "voice")}
             style={({ pressed }) => [
               styles.contactAction,
               pressed && styles.pressed,
@@ -510,7 +514,7 @@ export default function ContactsScreen() {
           </Pressable>
 
           <Pressable
-            onPress={() => openQall(item)}
+            onPress={() => void startContactCall(item, "video")}
             style={({ pressed }) => [
               styles.contactAction,
               pressed && styles.pressed,
@@ -535,6 +539,26 @@ export default function ContactsScreen() {
       <View style={styles.container}>
         <View style={styles.topRow}>
           <Text style={styles.heading}>Your contacts</Text>
+
+          <Pressable
+            onPress={() =>
+              router.push("/group-call-test" as any)
+            }
+            style={({ pressed }) => [
+              styles.addButton,
+              pressed && styles.pressed,
+            ]}
+          >
+            <Ionicons
+              name="people-circle-outline"
+              size={18}
+              color="#FFFFFF"
+            />
+            <Text style={styles.addButtonText}>
+              Group Test
+            </Text>
+          </Pressable>
+
 
           <Pressable
             onPress={openAddContact}
@@ -743,14 +767,13 @@ export default function ContactsScreen() {
             {foundProfile && (
               <View style={styles.foundSection}>
                 <View style={styles.foundProfile}>
-                  <UserAvatar
-                    avatarUrl={foundProfile.avatar_url}
-                    name={
-                      foundProfile.display_name ??
-                      "Global Qall User"
-                    }
-                    size={45}
-                  />
+                  <View style={styles.foundAvatar}>
+                    <Text style={styles.foundAvatarText}>
+                      {getInitial(
+                        foundProfile.display_name ?? "?"
+                      )}
+                    </Text>
+                  </View>
 
                   <View style={styles.foundDetails}>
                     <Text style={styles.foundName}>
@@ -886,11 +909,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
   },
   contactTopRow: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  contactProfileButton: {
-    flex: 1,
     flexDirection: "row",
     alignItems: "center",
   },

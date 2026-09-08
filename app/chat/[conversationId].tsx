@@ -54,7 +54,9 @@ import {
   createVideoCall,
   createVoiceCall,
 } from "../../lib/calling";
+import { startGroupCall, type GroupCallType } from "../../lib/groupCalling";
 import { supabase } from "../../lib/supabase";
+import { UserAvatar } from "../../components/UserAvatar";
 
 const PAGE_SIZE = 30;
 const MESSAGE_GROUP_WINDOW_MS = 5 * 60 * 1000;
@@ -72,7 +74,13 @@ type Message = {
   conversation_id: string;
   sender_id: string;
   body: string;
-  message_type: "text" | "image" | "video" | "file" | "voice";
+  message_type:
+    | "text"
+    | "image"
+    | "video"
+    | "file"
+    | "voice"
+    | "system";
   image_urls: string[];
   video_url: string | null;
   video_duration_seconds: number | null;
@@ -98,7 +106,13 @@ type Message = {
     sender_id: string;
     body: string;
     deleted_at: string | null;
-    message_type?: "text" | "image" | "video" | "file" | "voice";
+    message_type?:
+      | "text"
+      | "image"
+      | "video"
+      | "file"
+      | "voice"
+      | "system";
     image_urls?: string[];
     video_url?: string | null;
     video_duration_seconds?: number | null;
@@ -132,6 +146,140 @@ type Partner = {
   qall_id: string;
   avatar_url: string | null;
 };
+
+type GroupConversation = {
+  id: string;
+  name: string;
+  avatar_url: string | null;
+};
+
+type GroupMemberProfile = {
+  user_id: string;
+  role: "owner" | "admin" | "member";
+  display_name: string | null;
+  qall_id: string | null;
+  avatar_url: string | null;
+};
+
+function createReplySnapshot(message: Message) {
+  return {
+    id: message.id,
+    sender_id: message.sender_id,
+    body: message.body,
+    deleted_at: message.deleted_at,
+    message_type: message.message_type,
+    image_urls: message.image_urls,
+    video_url: message.video_url,
+    video_duration_seconds:
+      message.video_duration_seconds,
+    file_url: message.file_url,
+    file_name: message.file_name,
+    file_size_bytes: message.file_size_bytes,
+    file_mime_type: message.file_mime_type,
+    voice_url: message.voice_url,
+    voice_duration_seconds:
+      message.voice_duration_seconds,
+    link_url: message.link_url,
+    link_title: message.link_title,
+    link_description: message.link_description,
+    link_image_url: message.link_image_url,
+    link_site_name: message.link_site_name,
+  };
+}
+
+async function hydrateReplyPreviews(
+  conversationId: string,
+  sourceMessages: Message[]
+): Promise<Message[]> {
+  const replyIds = Array.from(
+    new Set(
+      sourceMessages
+        .map((message) => message.reply_to_message_id)
+        .filter((id): id is string => Boolean(id))
+    )
+  );
+
+  if (replyIds.length === 0) {
+    return sourceMessages;
+  }
+
+  const localById = new Map(
+    sourceMessages.map((message) => [
+      message.id,
+      message,
+    ])
+  );
+
+  const missingIds = replyIds.filter(
+    (id) => !localById.has(id)
+  );
+
+  if (missingIds.length > 0) {
+    const { data, error } = await supabase
+      .from("messages")
+      .select(
+        `
+          id,
+          conversation_id,
+          sender_id,
+          body,
+          message_type,
+          image_urls,
+          video_url,
+          video_duration_seconds,
+          file_url,
+          file_name,
+          file_size_bytes,
+          file_mime_type,
+          voice_url,
+          voice_duration_seconds,
+          link_url,
+          link_title,
+          link_description,
+          link_image_url,
+          link_site_name,
+          created_at,
+          edited_at,
+          deleted_at,
+          delivered_at,
+          read_at,
+          reply_to_message_id
+        `
+      )
+      .eq("conversation_id", conversationId)
+      .in("id", missingIds);
+
+    if (error) {
+      console.warn(
+        "Could not hydrate reply previews:",
+        error.message
+      );
+    } else {
+      for (const message of (data ?? []) as Message[]) {
+        localById.set(message.id, message);
+      }
+    }
+  }
+
+  return sourceMessages.map((message) => {
+    if (!message.reply_to_message_id) {
+      return {
+        ...message,
+        reply_to: null,
+      };
+    }
+
+    const target =
+      localById.get(message.reply_to_message_id) ?? null;
+
+    return {
+      ...message,
+      reply_to: target
+        ? createReplySnapshot(target)
+        : message.reply_to ?? null,
+    };
+  });
+}
 
 function formatMessageTime(value: string): string {
   return new Date(value).toLocaleTimeString([], {
@@ -788,6 +936,14 @@ export default function ChatScreen() {
 
   const [partner, setPartner] =
     useState<Partner | null>(null);
+  const [conversationType, setConversationType] =
+    useState<"direct" | "group">("direct");
+  const [groupConversation, setGroupConversation] =
+    useState<GroupConversation | null>(null);
+  const [groupMembers, setGroupMembers] =
+    useState<Record<string, GroupMemberProfile>>({});
+  const [groupTypingUserIds, setGroupTypingUserIds] =
+    useState<string[]>([]);
   const [messages, setMessages] =
     useState<Message[]>([]);
   const [reactionsByMessage, setReactionsByMessage] =
@@ -797,6 +953,8 @@ export default function ChatScreen() {
   const [messageText, setMessageText] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [startingGroupCallType, setStartingGroupCallType] =
+    useState<GroupCallType | null>(null);
   const [uploadingImages, setUploadingImages] =
     useState(false);
   const [uploadingVideo, setUploadingVideo] =
@@ -821,13 +979,20 @@ export default function ChatScreen() {
     200
   );
 
-  const markAsRead = useCallback(async () => {
+  const markAsRead = useCallback(async (
+    requestedType?: "direct" | "group"
+  ) => {
     if (!conversationId) {
       return;
     }
 
+    const effectiveType =
+      requestedType ?? conversationType;
+
     const { error } = await supabase.rpc(
-      "mark_conversation_read",
+      effectiveType === "group"
+        ? "mark_group_conversation_read"
+        : "mark_conversation_read",
       {
         requested_conversation_id: conversationId,
       }
@@ -839,7 +1004,7 @@ export default function ChatScreen() {
         error.message
       );
     }
-  }, [conversationId]);
+  }, [conversationId, conversationType]);
 
   const loadConversation = useCallback(async () => {
     if (!conversationId || !user) {
@@ -854,65 +1019,170 @@ export default function ChatScreen() {
       setShowJumpToLatest(false);
       setUnseenMessageCount(0);
 
-      const [
-        partnerResponse,
-        messagesResponse,
-        hiddenResponse,
-      ] = await Promise.all([
-        supabase.rpc(
-          "get_conversation_partner",
-          {
-            requested_conversation_id:
-              conversationId,
-          }
-        ),
+      const { data: conversationRow, error: conversationError } =
+        await supabase
+          .from("conversations")
+          .select("id, conversation_type, name, avatar_url")
+          .eq("id", conversationId)
+          .single();
 
-        supabase
-          .from("messages")
-          .select(
-            `
-              id,
-              conversation_id,
-              sender_id,
-              body,
-              message_type,
-              image_urls,
-              video_url,
-              video_duration_seconds,
-              file_url,
-              file_name,
-              file_size_bytes,
-              file_mime_type,
-              voice_url,
-              voice_duration_seconds,
-              link_url,
-              link_title,
-              link_description,
-              link_image_url,
-              link_site_name,
-              created_at,
-              edited_at,
-              deleted_at,
-              delivered_at,
-              read_at,
-              reply_to_message_id
-            `
-          )
-          .eq("conversation_id", conversationId)
-          .order("created_at", {
-            ascending: true,
-          })
-          .limit(500),
-
-        supabase
-          .from("message_hidden_for_users")
-          .select("message_id")
-          .eq("user_id", user.id),
-      ]);
-
-      if (partnerResponse.error) {
-        throw partnerResponse.error;
+      if (conversationError) {
+        throw conversationError;
       }
+
+      const isGroup =
+        conversationRow.conversation_type === "group";
+
+      setConversationType(isGroup ? "group" : "direct");
+
+      let loadedPartner: Partner | null = null;
+      let loadedGroup: GroupConversation | null = null;
+      let loadedGroupMembers:
+        Record<string, GroupMemberProfile> = {};
+
+      if (isGroup) {
+        loadedGroup = {
+          id: conversationRow.id,
+          name: conversationRow.name ?? "Group",
+          avatar_url: conversationRow.avatar_url ?? null,
+        };
+
+        const { data: membershipRows, error: membershipError } =
+          await supabase
+            .from("conversation_members")
+            .select("user_id, role")
+            .eq("conversation_id", conversationId);
+
+        if (membershipError) {
+          throw membershipError;
+        }
+
+        const memberIds = (membershipRows ?? []).map(
+          (row: any) => row.user_id
+        );
+
+        let profileRows: any[] = [];
+
+        if (memberIds.length > 0) {
+          const { data, error } = await supabase
+            .from("profiles")
+            .select("id, display_name, qall_id, avatar_url")
+            .in("id", memberIds);
+
+          if (error) {
+            throw error;
+          }
+
+          profileRows = data ?? [];
+        }
+
+        const profileById = new Map(
+          profileRows.map((profile) => [
+            profile.id,
+            profile,
+          ])
+        );
+
+        loadedGroupMembers = Object.fromEntries(
+          (membershipRows ?? []).map((membership: any) => {
+            const profile =
+              profileById.get(membership.user_id);
+
+            return [
+              membership.user_id,
+              {
+                user_id: membership.user_id,
+                role: membership.role,
+                display_name:
+                  profile?.display_name ?? null,
+                qall_id: profile?.qall_id ?? null,
+                avatar_url:
+                  profile?.avatar_url ?? null,
+              } satisfies GroupMemberProfile,
+            ];
+          })
+        );
+      } else {
+        const { data: partnerData, error: partnerError } =
+          await supabase.rpc(
+            "get_conversation_partner",
+            {
+              requested_conversation_id:
+                conversationId,
+            }
+          );
+
+        if (partnerError) {
+          throw partnerError;
+        }
+
+        const foundPartner =
+          partnerData?.[0] as Partner | undefined;
+
+        if (!foundPartner) {
+          throw new Error(
+            "Conversation not found or access denied."
+          );
+        }
+
+        const { data: partnerProfileData } =
+          await supabase
+            .from("profiles")
+            .select("avatar_url")
+            .eq("id", foundPartner.user_id)
+            .maybeSingle();
+
+        loadedPartner = {
+          ...foundPartner,
+          avatar_url:
+            partnerProfileData?.avatar_url ?? null,
+        };
+      }
+
+      const [messagesResponse, hiddenResponse] =
+        await Promise.all([
+          supabase
+            .from("messages")
+            .select(
+              `
+                id,
+                conversation_id,
+                sender_id,
+                body,
+                message_type,
+                image_urls,
+                video_url,
+                video_duration_seconds,
+                file_url,
+                file_name,
+                file_size_bytes,
+                file_mime_type,
+                voice_url,
+                voice_duration_seconds,
+                link_url,
+                link_title,
+                link_description,
+                link_image_url,
+                link_site_name,
+                created_at,
+                edited_at,
+                deleted_at,
+                delivered_at,
+                read_at,
+                reply_to_message_id
+              `
+            )
+            .eq("conversation_id", conversationId)
+            .order("created_at", {
+              ascending: true,
+            })
+            .limit(500),
+
+          supabase
+            .from("message_hidden_for_users")
+            .select("message_id")
+            .eq("user_id", user.id),
+        ]);
 
       if (messagesResponse.error) {
         throw messagesResponse.error;
@@ -922,45 +1192,28 @@ export default function ChatScreen() {
         throw hiddenResponse.error;
       }
 
-      const foundPartner =
-        partnerResponse.data?.[0] as
-          | Partner
-          | undefined;
-
-      if (!foundPartner) {
-        throw new Error(
-          "Conversation not found or access denied."
-        );
-      }
-
-      const { data: partnerProfileData } =
-        await supabase
-          .from("profiles")
-          .select("avatar_url")
-          .eq("id", foundPartner.user_id)
-          .maybeSingle();
-
-      const partnerWithAvatar: Partner = {
-        ...foundPartner,
-        avatar_url:
-          partnerProfileData?.avatar_url ?? null,
-      };
-
       const hiddenMessageIds = new Set(
         (hiddenResponse.data ?? []).map(
           (row) => row.message_id
         )
       );
 
-      const visibleMessages = (
-        (messagesResponse.data ?? []) as Message[]
-      ).filter(
+      const allLoadedMessages =
+        (messagesResponse.data ?? []) as Message[];
+
+      const visibleMessages = allLoadedMessages.filter(
         (message) => !hiddenMessageIds.has(message.id)
       );
 
+      const hydratedVisibleMessages =
+        await hydrateReplyPreviews(
+          conversationId,
+          visibleMessages
+        );
+
       let loadedReactions: MessageReaction[] = [];
 
-      if (visibleMessages.length > 0) {
+      if (hydratedVisibleMessages.length > 0) {
         const { data: reactionsData, error: reactionsError } =
           await supabase
             .from("message_reactions")
@@ -969,7 +1222,9 @@ export default function ChatScreen() {
             )
             .in(
               "message_id",
-              visibleMessages.map((message) => message.id)
+              hydratedVisibleMessages.map(
+                (message) => message.id
+              )
             )
             .order("created_at", {
               ascending: true,
@@ -994,13 +1249,17 @@ export default function ChatScreen() {
           return result;
         }, {});
 
-      setPartner(partnerWithAvatar);
-      setMessages(visibleMessages);
+      setPartner(loadedPartner);
+      setGroupConversation(loadedGroup);
+      setGroupMembers(loadedGroupMembers);
+      setMessages(hydratedVisibleMessages);
       setReactionsByMessage(groupedReactions);
 
-      await markAsRead();
+      await markAsRead(
+        isGroup ? "group" : "direct"
+      );
 
-      if (visibleMessages.length === 0) {
+      if (hydratedVisibleMessages.length === 0) {
         initialScrollCompletedRef.current = true;
         setInitialListReady(true);
       }
@@ -1157,9 +1416,21 @@ export default function ChatScreen() {
             typingPayload.user_id &&
             typingPayload.user_id !== user.id
           ) {
-            setPartnerTyping(
-              Boolean(typingPayload.is_typing)
-            );
+            if (conversationType === "group") {
+              setGroupTypingUserIds((current) => {
+                const next = new Set(current);
+                if (typingPayload.is_typing) {
+                  next.add(typingPayload.user_id!);
+                } else {
+                  next.delete(typingPayload.user_id!);
+                }
+                return Array.from(next);
+              });
+            } else {
+              setPartnerTyping(
+                Boolean(typingPayload.is_typing)
+              );
+            }
           }
         }
       )
@@ -1172,9 +1443,33 @@ export default function ChatScreen() {
           filter:
             `conversation_id=eq.${conversationId}`,
         },
-        (payload) => {
-          const incomingMessage =
+        async (payload) => {
+          let incomingMessage =
             payload.new as Message;
+
+          if (incomingMessage.reply_to_message_id) {
+            const localReplyTarget = messages.find(
+              (message) =>
+                message.id ===
+                incomingMessage.reply_to_message_id
+            );
+
+            if (localReplyTarget) {
+              incomingMessage = {
+                ...incomingMessage,
+                reply_to:
+                  createReplySnapshot(localReplyTarget),
+              };
+            } else {
+              const hydrated =
+                await hydrateReplyPreviews(
+                  conversationId,
+                  [incomingMessage]
+                );
+              incomingMessage =
+                hydrated[0] ?? incomingMessage;
+            }
+          }
 
           setMessages((current) =>
             reconcileMessage(
@@ -1187,7 +1482,15 @@ export default function ChatScreen() {
           if (
             incomingMessage.sender_id !== user.id
           ) {
-            setPartnerTyping(false);
+            if (conversationType === "group") {
+              setGroupTypingUserIds((current) =>
+                current.filter(
+                  (id) => id !== incomingMessage.sender_id
+                )
+              );
+            } else {
+              setPartnerTyping(false);
+            }
             markAsRead();
           }
 
@@ -1692,7 +1995,8 @@ export default function ChatScreen() {
             edited_at,
             deleted_at,
             delivered_at,
-            read_at
+            read_at,
+            reply_to_message_id
           `
         )
         .single();
@@ -1701,7 +2005,16 @@ export default function ChatScreen() {
         throw error;
       }
 
-      const savedMessage = data as Message;
+      const savedMessage = {
+        ...(data as Message),
+        reply_to_message_id:
+          (data as Message).reply_to_message_id ??
+          replyTarget?.id ??
+          null,
+        reply_to: replyTarget
+          ? createReplySnapshot(replyTarget)
+          : null,
+      } as Message;
 
       setMessages((current) => {
         const withoutLocal = current.filter(
@@ -3098,6 +3411,104 @@ export default function ChatScreen() {
     }
   }
 
+  async function startPartnerCall(
+    callType: "voice" | "video"
+  ) {
+    if (!partner || conversationType !== "direct") {
+      return;
+    }
+
+    try {
+      const callId =
+        callType === "video"
+          ? await createVideoCall(partner.user_id)
+          : await createVoiceCall(partner.user_id);
+
+      if (!callId) {
+        throw new Error("Call could not be created.");
+      }
+
+      router.push({
+        pathname: "/call/[callId]",
+        params: { callId },
+      });
+    } catch (error) {
+      Alert.alert(
+        "Call error",
+        error instanceof Error
+          ? error.message
+          : "Could not start the call."
+      );
+    }
+  }
+
+
+  async function startConversationGroupCall(
+    callType: GroupCallType
+  ) {
+    if (
+      conversationType !== "group" ||
+      !conversationId ||
+      startingGroupCallType
+    ) {
+      return;
+    }
+
+    try {
+      setStartingGroupCallType(callType);
+
+      const groupCallId = await startGroupCall(
+        conversationId,
+        callType
+      );
+
+      if (!groupCallId) {
+        throw new Error("Group call could not be created.");
+      }
+
+      router.push(
+        `/group-call/${groupCallId}` as any
+      );
+    } catch (error) {
+      Alert.alert(
+        "Group call",
+        error instanceof Error
+          ? error.message
+          : "Could not start the group call."
+      );
+    } finally {
+      setStartingGroupCallType(null);
+    }
+  }
+
+
+  function jumpToReplyTarget(
+    replyToMessageId: string | null
+  ) {
+    if (!replyToMessageId) {
+      return;
+    }
+
+    const targetIndex = messages.findIndex(
+      (message) => message.id === replyToMessageId
+    );
+
+    if (targetIndex < 0) {
+      Alert.alert(
+        "Original message",
+        "The original message is outside the currently loaded chat history."
+      );
+      return;
+    }
+
+    listRef.current?.scrollToIndex({
+      index: targetIndex,
+      animated: true,
+      viewPosition: 0.45,
+    });
+  }
+
+
   function renderMessage({
     item,
     index,
@@ -3128,6 +3539,28 @@ export default function ChatScreen() {
       );
 
     const isMine = item.sender_id === user?.id;
+    const isSystemMessage =
+      item.message_type === "system";
+
+    if (isSystemMessage) {
+      return (
+        <View style={styles.systemMessageRow}>
+          <View style={styles.systemMessagePill}>
+            <Ionicons
+              name="information-circle-outline"
+              size={14}
+              color="#60706B"
+            />
+            <Text style={styles.systemMessageText}>
+              {item.body}
+            </Text>
+          </View>
+          <Text style={styles.systemMessageTime}>
+            {formatMessageTime(item.created_at)}
+          </Text>
+        </View>
+      );
+    }
     const actionsVisible =
       selectedMessageId === item.id &&
       !item.deleted_at;
@@ -3157,7 +3590,14 @@ export default function ChatScreen() {
                 color: "#D4ECE7",
               };
 
-    const statusLabel = getMessageStatusLabel(item);
+    const statusLabel =
+      conversationType === "group" && isMine
+        ? item.client_status === "sending"
+          ? "Sending"
+          : item.client_status === "failed"
+            ? "Failed"
+            : "Sent"
+        : getMessageStatusLabel(item);
     const messageReactions =
       reactionsByMessage[item.id] ?? [];
     const groupedReactions =
@@ -3322,6 +3762,30 @@ export default function ChatScreen() {
                 : styles.lastMessageRow,
             ]}
           >
+          {conversationType === "group" &&
+            !isMine &&
+            !groupedWithPrevious && (
+              <View style={styles.groupSenderIdentity}>
+                <UserAvatar
+                  avatarUrl={
+                    groupMembers[item.sender_id]?.avatar_url ??
+                    null
+                  }
+                  name={
+                    groupMembers[item.sender_id]?.display_name ??
+                    groupMembers[item.sender_id]?.qall_id ??
+                    "Member"
+                  }
+                  size={25}
+                />
+                <Text style={styles.groupSenderName}>
+                  {groupMembers[item.sender_id]?.display_name ??
+                    groupMembers[item.sender_id]?.qall_id ??
+                    "Group member"}
+                </Text>
+              </View>
+            )}
+
           <Pressable
             onPress={() => toggleMessageActions(item)}
             onLongPress={() =>
@@ -3354,7 +3818,12 @@ export default function ChatScreen() {
             ]}
           >
             {replyPreview && (
-              <View
+              <Pressable
+                onPress={() =>
+                  jumpToReplyTarget(
+                    item.reply_to_message_id
+                  )
+                }
                 style={[
                   styles.replyQuote,
                   isMine
@@ -3380,8 +3849,16 @@ export default function ChatScreen() {
                     {replyPreview.sender_id ===
                     user?.id
                       ? "You"
-                      : partner?.contact_name ??
-                        "Contact"}
+                      : conversationType === "group"
+                        ? groupMembers[
+                            replyPreview.sender_id
+                          ]?.display_name ??
+                          groupMembers[
+                            replyPreview.sender_id
+                          ]?.qall_id ??
+                          "Group member"
+                        : partner?.contact_name ??
+                          "Contact"}
                   </Text>
                   <Text
                     numberOfLines={1}
@@ -3435,7 +3912,7 @@ export default function ChatScreen() {
                         : replyPreview.body}
                   </Text>
                 </View>
-              </View>
+              </Pressable>
             )}
 
             {isImageMessage && !item.deleted_at && (
@@ -4023,7 +4500,9 @@ export default function ChatScreen() {
       <Stack.Screen
         options={{
           title:
-            partner?.contact_name ?? "Chat",
+            conversationType === "group"
+              ? groupConversation?.name ?? "Group"
+              : partner?.contact_name ?? "Chat",
           headerBackTitle: "Chats",
         }}
       />
@@ -4050,7 +4529,162 @@ export default function ChatScreen() {
             </View>
           ) : (
             <>
-              {partner && (
+              {conversationType === "group" &&
+                groupConversation && (
+                  <View style={styles.partnerBar}>
+                    <Pressable
+                      onPress={() =>
+                        router.push({
+                          pathname:
+                            "/group/[conversationId]",
+                          params: { conversationId },
+                        })
+                      }
+                      style={styles.groupHeaderIdentity}
+                    >
+                      <UserAvatar
+                        avatarUrl={groupConversation.avatar_url}
+                        name={groupConversation.name}
+                        size={45}
+                      />
+
+                      <View style={styles.partnerDetails}>
+                        <Text style={styles.partnerName}>
+                          {groupConversation.name}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.partnerPresence,
+                            groupTypingUserIds.length > 0 &&
+                              styles.activePresence,
+                          ]}
+                        >
+                          {groupTypingUserIds.length > 0
+                            ? `${
+                                groupMembers[
+                                  groupTypingUserIds[0]
+                                ]?.display_name ??
+                                groupMembers[
+                                  groupTypingUserIds[0]
+                                ]?.qall_id ??
+                                "Someone"
+                              }${
+                                groupTypingUserIds.length > 1
+                                  ? ` +${
+                                      groupTypingUserIds.length - 1
+                                    }`
+                                  : ""
+                              } typing...`
+                            : (() => {
+                                const memberList =
+                                  Object.values(groupMembers);
+                                const count = memberList.length;
+                                const firstNames = memberList
+                                  .filter(
+                                    (member) =>
+                                      member.user_id !== user?.id
+                                  )
+                                  .slice(0, 2)
+                                  .map(
+                                    (member) =>
+                                      member.display_name ??
+                                      member.qall_id ??
+                                      "Member"
+                                  );
+
+                                return firstNames.length > 0
+                                  ? `${count} members • ${firstNames.join(
+                                      ", "
+                                    )}${
+                                      count - 1 >
+                                      firstNames.length
+                                        ? "…"
+                                        : ""
+                                    }`
+                                  : `${count} members`;
+                              })()}
+                        </Text>
+                      </View>
+                    </Pressable>
+
+                    <View style={styles.partnerCallActions}>
+                      <Pressable
+                        onPress={() =>
+                          void startConversationGroupCall("voice")
+                        }
+                        disabled={startingGroupCallType !== null}
+                        style={[
+                          styles.partnerCallButton,
+                          startingGroupCallType !== null &&
+                            styles.groupCallButtonDisabled,
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Start group voice call"
+                      >
+                        {startingGroupCallType === "voice" ? (
+                          <ActivityIndicator
+                            size="small"
+                            color="#176B5B"
+                          />
+                        ) : (
+                          <Ionicons
+                            name="call-outline"
+                            size={21}
+                            color="#176B5B"
+                          />
+                        )}
+                      </Pressable>
+
+                      <Pressable
+                        onPress={() =>
+                          void startConversationGroupCall("video")
+                        }
+                        disabled={startingGroupCallType !== null}
+                        style={[
+                          styles.partnerCallButton,
+                          startingGroupCallType !== null &&
+                            styles.groupCallButtonDisabled,
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Start group video call"
+                      >
+                        {startingGroupCallType === "video" ? (
+                          <ActivityIndicator
+                            size="small"
+                            color="#176B5B"
+                          />
+                        ) : (
+                          <Ionicons
+                            name="videocam-outline"
+                            size={22}
+                            color="#176B5B"
+                          />
+                        )}
+                      </Pressable>
+
+                      <Pressable
+                        onPress={() =>
+                          router.push({
+                            pathname:
+                              "/group/[conversationId]",
+                            params: { conversationId },
+                          })
+                        }
+                        style={styles.partnerCallButton}
+                        accessibilityRole="button"
+                        accessibilityLabel="Group information"
+                      >
+                        <Ionicons
+                          name="information-circle-outline"
+                          size={23}
+                          color="#176B5B"
+                        />
+                      </Pressable>
+                    </View>
+                  </View>
+                )}
+
+              {conversationType === "direct" && partner && (
                 <View style={styles.partnerBar}>
                   <View style={styles.avatarContainer}>
                     {partner.avatar_url ? (
@@ -4248,8 +4882,16 @@ export default function ChatScreen() {
                       {replyingToMessage.sender_id ===
                       user?.id
                         ? "yourself"
-                        : partner?.contact_name ??
-                          "contact"}
+                        : conversationType === "group"
+                          ? groupMembers[
+                              replyingToMessage.sender_id
+                            ]?.display_name ??
+                            groupMembers[
+                              replyingToMessage.sender_id
+                            ]?.qall_id ??
+                            "group member"
+                          : partner?.contact_name ??
+                            "contact"}
                     </Text>
 
                     <Text
@@ -5437,6 +6079,46 @@ const styles = StyleSheet.create({
   myEditedText: {
     color: "#D4ECE7",
   },
+  systemMessageRow: {
+    alignItems: "center",
+    paddingHorizontal: 28,
+    paddingVertical: 7,
+  },
+  systemMessagePill: {
+    maxWidth: "92%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: "#EEF2F0",
+  },
+  systemMessageText: {
+    flexShrink: 1,
+    textAlign: "center",
+    fontSize: 12,
+    lineHeight: 17,
+    color: "#53615D",
+  },
+  systemMessageTime: {
+    marginTop: 3,
+    fontSize: 10,
+    color: "#98A39F",
+  },
+  groupSenderIdentity: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    marginBottom: 4,
+    marginLeft: 2,
+  },
+  groupSenderName: {
+    maxWidth: 210,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#52605C",
+  },
   typingIndicatorRow: {
     minHeight: 38,
     flexDirection: "row",
@@ -5779,6 +6461,17 @@ const styles = StyleSheet.create({
   },
   pressed: {
     opacity: 0.78,
+  },
+
+  groupHeaderIdentity: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 11,
+  },
+  groupCallButtonDisabled: {
+    opacity: 0.5,
   },
 
   partnerCallActions: {

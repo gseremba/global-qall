@@ -55,20 +55,43 @@ function statusLabel(item: HistoryItem): string {
     return "Missed incoming call";
   }
 
+  const direction =
+    item.direction === "incoming"
+      ? "Incoming"
+      : "Outgoing";
+
+  if (item.status === "missed") {
+    return `${direction}: No answer`;
+  }
+
+  if (item.status === "declined") {
+    return `${direction}: Call declined`;
+  }
+
+  if (item.status === "failed") {
+    const failureLabel =
+      item.end_reason === "unreachable"
+        ? "User unavailable"
+        : item.end_reason === "connecting_timeout"
+          ? "Unable to connect"
+          : item.end_reason === "connection_lost"
+            ? "Connection lost"
+            : item.end_reason === "busy"
+              ? "User is busy"
+              : "Call failed";
+
+    return `${direction}: ${failureLabel}`;
+  }
+
   const labels: Record<string, string> = {
     ringing: "Ringing",
     accepted: "Connected",
-    declined: "Declined",
     ended: "Completed",
-    missed: "No answer",
-    failed: "Failed",
   };
 
-  return `${
-    item.direction === "incoming"
-      ? "Incoming"
-      : "Outgoing"
-  } · ${labels[item.status] ?? item.status}`;
+  return `${direction}: ${
+    labels[item.status] ?? item.status
+  }`;
 }
 
 export default function CallHistoryScreen() {

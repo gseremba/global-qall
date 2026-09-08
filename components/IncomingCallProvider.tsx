@@ -4,6 +4,7 @@ import {
   useEffect,
   useRef,
 } from "react";
+import { Platform } from "react-native";
 
 import { useAuth } from "../contexts/AuthContext";
 import {
@@ -30,6 +31,9 @@ export function IncomingCallProvider({
 }: PropsWithChildren) {
   const { user } = useAuth();
   const displayedCallIdsRef = useRef(new Set<string>());
+  const acknowledgedCallIdsRef = useRef(new Set<string>());
+  const answeredCallIdsRef = useRef(new Set<string>());
+  const endingCallIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (!user) return;
@@ -48,28 +52,107 @@ export function IncomingCallProvider({
       return data as CallerProfile | null;
     };
 
+    const acknowledgeIncomingCall = async (
+      callId: string
+    ) => {
+      if (acknowledgedCallIdsRef.current.has(callId)) {
+        console.log("[CALL RACE]", {
+          callId,
+          event: "duplicate_acknowledgement_ignored",
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      acknowledgedCallIdsRef.current.add(callId);
+
+      const { error } = await supabase.rpc(
+        "acknowledge_incoming_call",
+        {
+          requested_call_id: callId,
+        }
+      );
+
+      if (error) {
+        // Allow the recovery path / display callback to retry after a real
+        // transport failure.
+        acknowledgedCallIdsRef.current.delete(callId);
+
+        console.warn(
+          "Could not acknowledge incoming call:",
+          error.message
+        );
+        return;
+      }
+
+      console.log("[CALL DELIVERY]", {
+        callId,
+        event: "incoming_call_acknowledged_provider",
+        timestamp: new Date().toISOString(),
+      });
+    };
+
     const showIncomingCall = async (call: VoiceCall) => {
       if (
         !active ||
         call.callee_id !== user.id ||
-        call.status !== "ringing" ||
-        displayedCallIdsRef.current.has(call.id)
+        call.status !== "ringing"
       ) {
+        return;
+      }
+
+      if (displayedCallIdsRef.current.has(call.id)) {
+        console.log("[CALL RACE]", {
+          callId: call.id,
+          event: "duplicate_incoming_display_ignored",
+          timestamp: new Date().toISOString(),
+        });
         return;
       }
 
       displayedCallIdsRef.current.add(call.id);
       const profile = await loadCaller(call.caller_id);
 
-      await displayNativeIncomingCall({
-        callId: call.id,
-        handle: profile?.qall_id ?? "Global Qall",
-        callerName:
-          profile?.display_name?.trim() ||
-          profile?.qall_id ||
-          "Global Qall caller",
-        hasVideo: call.call_type === "video",
-      });
+      try {
+        if (Platform.OS === "android") {
+          console.log("[INCOMING CALL] Android foreground route", {
+            callId: call.id,
+            callType: call.call_type,
+          });
+
+          router.push({
+            pathname: "/call/[callId]",
+            params: {
+              callId: call.id,
+              direction: "incoming",
+            },
+          });
+
+          await acknowledgeIncomingCall(call.id);
+          return;
+        }
+
+        await displayNativeIncomingCall({
+          callId: call.id,
+          handle: profile?.qall_id ?? "Global Qall",
+          callerName:
+            profile?.display_name?.trim() ||
+            profile?.qall_id ||
+            "Global Qall caller",
+          hasVideo: call.call_type === "video",
+        });
+
+        await acknowledgeIncomingCall(call.id);
+      } catch (error) {
+        displayedCallIdsRef.current.delete(call.id);
+
+        console.warn(
+          "Could not display/acknowledge incoming call:",
+          error instanceof Error
+            ? error.message
+            : error
+        );
+      }
     };
 
     const recoverIncomingCall = async () => {
@@ -101,6 +184,17 @@ export function IncomingCallProvider({
     const answerListener = RNCallKeep.addEventListener(
       "answerCall",
       ({ callUUID }) => {
+        if (answeredCallIdsRef.current.has(callUUID)) {
+          console.log("[CALL RACE]", {
+            callId: callUUID,
+            event: "duplicate_callkit_answer_ignored",
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        answeredCallIdsRef.current.add(callUUID);
+
         router.push({
           pathname: "/call/[callId]",
           params: {
@@ -115,15 +209,46 @@ export function IncomingCallProvider({
     const endListener = RNCallKeep.addEventListener(
       "endCall",
       async ({ callUUID }) => {
-        const { data } = await supabase
-          .from("calls")
-          .select("status")
-          .eq("id", callUUID)
-          .maybeSingle();
+        if (endingCallIdsRef.current.has(callUUID)) {
+          console.log("[CALL RACE]", {
+            callId: callUUID,
+            event: "duplicate_callkit_end_ignored",
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
 
-        const wasRinging = data?.status === "ringing";
+        endingCallIdsRef.current.add(callUUID);
 
         try {
+          const { data, error } = await supabase
+            .from("calls")
+            .select("status")
+            .eq("id", callUUID)
+            .maybeSingle();
+
+          if (error) {
+            throw error;
+          }
+
+          if (
+            !data ||
+            data.status === "declined" ||
+            data.status === "ended" ||
+            data.status === "missed" ||
+            data.status === "failed"
+          ) {
+            console.log("[CALL RACE]", {
+              callId: callUUID,
+              event: "callkit_end_already_terminal",
+              status: data?.status ?? null,
+              timestamp: new Date().toISOString(),
+            });
+            return;
+          }
+
+          const wasRinging = data.status === "ringing";
+
           await finishVoiceCall(
             callUUID,
             wasRinging ? "declined" : "ended",
@@ -132,6 +257,10 @@ export function IncomingCallProvider({
               : "ended_from_callkit",
           );
         } catch (error) {
+          // Permit a retry only when the action did not successfully reach
+          // the authoritative database.
+          endingCallIdsRef.current.delete(callUUID);
+
           console.warn(
             "Could not finish CallKit call:",
             error,
@@ -149,11 +278,18 @@ export function IncomingCallProvider({
             "CallKit could not display incoming call:",
             error,
           );
+          return;
         }
+
+        void acknowledgeIncomingCall(callUUID);
       },
     );
 
-    void setupCallKit().then(recoverIncomingCall);
+    if (Platform.OS === "ios") {
+      void setupCallKit().then(recoverIncomingCall);
+    } else {
+      void recoverIncomingCall();
+    }
 
     const recoveryTimer = setInterval(
       recoverIncomingCall,
@@ -221,6 +357,9 @@ export function IncomingCallProvider({
       active = false;
       clearInterval(recoveryTimer);
       displayedCallIdsRef.current.clear();
+      acknowledgedCallIdsRef.current.clear();
+      answeredCallIdsRef.current.clear();
+      endingCallIdsRef.current.clear();
       answerListener.remove();
       endListener.remove();
       displayListener.remove();

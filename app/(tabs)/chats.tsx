@@ -16,11 +16,12 @@ import {
 
 import { useAuth } from "../../contexts/AuthContext";
 import { supabase } from "../../lib/supabase";
-import {UserAvatar } from "../../components/UserAvatar";
+import { UserAvatar } from "../../components/UserAvatar";
 
 type Conversation = {
   conversation_id: string;
-  other_user_id: string;
+  conversation_type: "direct" | "group";
+  other_user_id: string | null;
   contact_name: string;
   display_name: string | null;
   avatar_url: string | null;
@@ -29,13 +30,11 @@ type Conversation = {
   last_message_at: string | null;
   last_sender_id: string | null;
   unread_count: number;
+  member_count?: number;
 };
 
-
 function formatMessageTime(value: string | null): string {
-  if (!value) {
-    return "";
-  }
+  if (!value) return "";
 
   const date = new Date(value);
   const now = new Date();
@@ -76,23 +75,22 @@ export default function ChatsScreen() {
     }
 
     try {
-      const { data, error } = await supabase.rpc(
-        "get_my_conversations"
-      );
+      // Existing direct conversations remain sourced from the current RPC.
+      const { data: directData, error: directError } =
+        await supabase.rpc("get_my_conversations");
 
-      if (error) {
-        throw error;
-      }
+      if (directError) throw directError;
 
-      const baseRows = (data ?? []).map((row: any) => ({
+      const directBase = (directData ?? []).map((row: any) => ({
         ...row,
+        conversation_type: "direct" as const,
         avatar_url: null,
         unread_count: Number(row.unread_count ?? 0),
       }));
 
       const otherUserIds = Array.from(
         new Set(
-          baseRows
+          directBase
             .map((row: any) => row.other_user_id)
             .filter(Boolean)
         )
@@ -107,9 +105,7 @@ export default function ChatsScreen() {
             .select("id, avatar_url")
             .in("id", otherUserIds);
 
-        if (profileError) {
-          throw profileError;
-        }
+        if (profileError) throw profileError;
 
         avatarByUserId = Object.fromEntries(
           (profileRows ?? []).map((profile: any) => [
@@ -119,13 +115,55 @@ export default function ChatsScreen() {
         );
       }
 
-      const rows = baseRows.map((row: any) => ({
-        ...row,
-        avatar_url:
-          avatarByUserId[row.other_user_id] ?? null,
-      }));
+      const directRows: Conversation[] = directBase.map(
+        (row: any) => ({
+          ...row,
+          avatar_url:
+            avatarByUserId[row.other_user_id] ?? null,
+        })
+      );
 
-      setConversations(rows);
+      // Group conversations use the authoritative 11.4B RPC so unread
+      // counts are exact and based on each member's last_read_at.
+      const { data: groupData, error: groupError } =
+        await supabase.rpc("get_my_group_conversations");
+
+      if (groupError) throw groupError;
+
+      const groupRows: Conversation[] = (groupData ?? []).map(
+        (row: any) => ({
+          conversation_id: row.conversation_id,
+          conversation_type: "group",
+          other_user_id: null,
+          contact_name: row.group_name ?? "Group",
+          display_name: row.group_name ?? "Group",
+          avatar_url: row.avatar_url ?? null,
+          qall_id: `${Number(row.member_count ?? 0)} ${
+            Number(row.member_count ?? 0) === 1
+              ? "member"
+              : "members"
+          }`,
+          last_message: row.last_message ?? null,
+          last_message_at: row.last_message_at ?? null,
+          last_sender_id: row.last_sender_id ?? null,
+          unread_count: Number(row.unread_count ?? 0),
+          member_count: Number(row.member_count ?? 0),
+        })
+      );
+
+      const merged = [...directRows, ...groupRows].sort(
+        (a, b) => {
+          const aTime = a.last_message_at
+            ? new Date(a.last_message_at).getTime()
+            : 0;
+          const bTime = b.last_message_at
+            ? new Date(b.last_message_at).getTime()
+            : 0;
+          return bTime - aTime;
+        }
+      );
+
+      setConversations(merged);
     } catch (error) {
       Alert.alert(
         "Chats error",
@@ -152,9 +190,25 @@ export default function ChatsScreen() {
             schema: "public",
             table: "messages",
           },
-          () => {
-            loadConversations();
-          }
+          loadConversations
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "conversation_members",
+          },
+          loadConversations
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "conversations",
+          },
+          loadConversations
         )
         .subscribe();
 
@@ -164,15 +218,11 @@ export default function ChatsScreen() {
     }, [loadConversations, user?.id])
   );
 
-  const normalizedSearch = searchText
-    .trim()
-    .toLowerCase();
+  const normalizedSearch = searchText.trim().toLowerCase();
 
   const filteredConversations = conversations.filter(
     (conversation) => {
-      if (!normalizedSearch) {
-        return true;
-      }
+      if (!normalizedSearch) return true;
 
       return (
         conversation.contact_name
@@ -185,17 +235,27 @@ export default function ChatsScreen() {
     }
   );
 
-  function openConversation(conversationId: string) {
+  function openConversation(item: Conversation) {
+    if (item.conversation_type === "group") {
+      router.push({
+        pathname: "/chat/[conversationId]",
+        params: { conversationId: item.conversation_id },
+      });
+      return;
+    }
+
     router.push({
       pathname: "/chat/[conversationId]",
-      params: {
-        conversationId,
-      },
+      params: { conversationId: item.conversation_id },
     });
   }
 
   function openContacts() {
     router.push("/contacts");
+  }
+
+  function openNewGroup() {
+    router.push("/group/new");
   }
 
   function renderConversation({
@@ -208,27 +268,35 @@ export default function ChatsScreen() {
 
     return (
       <Pressable
-        onPress={() =>
-          openConversation(item.conversation_id)
-        }
+        onPress={() => openConversation(item)}
         style={({ pressed }) => [
           styles.conversationCard,
           pressed && styles.pressed,
         ]}
       >
-        <UserAvatar
-          avatarUrl={item.avatar_url}
-          name={item.display_name ?? item.contact_name}
-          size={54}
-        />
+        <View style={styles.avatarWrap}>
+          <UserAvatar
+            avatarUrl={item.avatar_url}
+            name={item.display_name ?? item.contact_name}
+            size={54}
+          />
+          {item.conversation_type === "group" && (
+            <View style={styles.groupBadge}>
+              <Ionicons
+                name="people"
+                size={11}
+                color="#FFFFFF"
+              />
+            </View>
+          )}
+        </View>
 
         <View style={styles.conversationContent}>
           <View style={styles.conversationHeader}>
             <Text
               style={[
                 styles.contactName,
-                item.unread_count > 0 &&
-                  styles.unreadName,
+                item.unread_count > 0 && styles.unreadName,
               ]}
               numberOfLines={1}
             >
@@ -238,8 +306,7 @@ export default function ChatsScreen() {
             <Text
               style={[
                 styles.messageTime,
-                item.unread_count > 0 &&
-                  styles.unreadTime,
+                item.unread_count > 0 && styles.unreadTime,
               ]}
             >
               {formatMessageTime(item.last_message_at)}
@@ -256,9 +323,11 @@ export default function ChatsScreen() {
               numberOfLines={1}
             >
               {item.last_message
-                ? `${
-                    sentByCurrentUser ? "You: " : ""
-                  }${item.last_message}`
+                ? `${sentByCurrentUser ? "You: " : ""}${
+                    item.last_message
+                  }`
+                : item.conversation_type === "group"
+                ? "Group created"
                 : "Start a conversation"}
             </Text>
 
@@ -274,7 +343,9 @@ export default function ChatsScreen() {
           </View>
 
           <Text style={styles.qallId}>
-            {item.qall_id}
+            {item.conversation_type === "group"
+              ? item.qall_id
+              : item.qall_id}
           </Text>
         </View>
       </Pressable>
@@ -287,22 +358,38 @@ export default function ChatsScreen() {
         <View style={styles.topRow}>
           <Text style={styles.heading}>Chats</Text>
 
-          <Pressable
-            onPress={openContacts}
-            style={({ pressed }) => [
-              styles.newChatButton,
-              pressed && styles.pressed,
-            ]}
-          >
-            <Ionicons
-              name="create-outline"
-              size={19}
-              color="#FFFFFF"
-            />
-            <Text style={styles.newChatText}>
-              New Chat
-            </Text>
-          </Pressable>
+          <View style={styles.headerActions}>
+            <Pressable
+              onPress={openNewGroup}
+              style={({ pressed }) => [
+                styles.groupButton,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Ionicons
+                name="people-outline"
+                size={18}
+                color="#176B5B"
+              />
+              <Text style={styles.groupButtonText}>
+                New Group
+              </Text>
+            </Pressable>
+
+            <Pressable
+              onPress={openContacts}
+              style={({ pressed }) => [
+                styles.newChatButton,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Ionicons
+                name="create-outline"
+                size={19}
+                color="#FFFFFF"
+              />
+            </Pressable>
+          </View>
         </View>
 
         <View style={styles.searchContainer}>
@@ -311,16 +398,14 @@ export default function ChatsScreen() {
             size={20}
             color="#72807C"
           />
-
           <TextInput
             value={searchText}
             onChangeText={setSearchText}
-            placeholder="Search chats"
+            placeholder="Search chats and groups"
             autoCapitalize="none"
             autoCorrect={false}
             style={styles.searchInput}
           />
-
           {searchText.length > 0 && (
             <Pressable
               onPress={() => setSearchText("")}
@@ -345,9 +430,7 @@ export default function ChatsScreen() {
         ) : (
           <FlatList
             data={filteredConversations}
-            keyExtractor={(item) =>
-              item.conversation_id
-            }
+            keyExtractor={(item) => item.conversation_id}
             renderItem={renderConversation}
             showsVerticalScrollIndicator={false}
             contentContainerStyle={[
@@ -378,37 +461,16 @@ export default function ChatsScreen() {
                     color="#176B5B"
                   />
                 </View>
-
                 <Text style={styles.emptyTitle}>
                   {searchText
                     ? "No matching chats"
                     : "No conversations yet"}
                 </Text>
-
                 <Text style={styles.emptyText}>
                   {searchText
-                    ? "Try another contact name or Qall ID."
-                    : "Choose a contact and send your first message."}
+                    ? "Try another contact name, group name, or Qall ID."
+                    : "Start a direct chat or create your first group."}
                 </Text>
-
-                {!searchText && (
-                  <Pressable
-                    onPress={openContacts}
-                    style={({ pressed }) => [
-                      styles.emptyButton,
-                      pressed && styles.pressed,
-                    ]}
-                  >
-                    <Ionicons
-                      name="people-outline"
-                      size={19}
-                      color="#FFFFFF"
-                    />
-                    <Text style={styles.emptyButtonText}>
-                      Open Contacts
-                    </Text>
-                  </Pressable>
-                )}
               </View>
             }
           />
@@ -439,18 +501,34 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     color: "#18201E",
   },
-  newChatButton: {
-    minHeight: 42,
+  headerActions: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
-    paddingHorizontal: 14,
+    gap: 8,
+  },
+  groupButton: {
+    minHeight: 40,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 11,
+    borderWidth: 1,
+    borderColor: "#BFD9D3",
+    borderRadius: 12,
+    backgroundColor: "#FFFFFF",
+  },
+  groupButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#176B5B",
+  },
+  newChatButton: {
+    width: 42,
+    height: 42,
+    alignItems: "center",
+    justifyContent: "center",
     borderRadius: 12,
     backgroundColor: "#176B5B",
-  },
-  newChatText: {
-    fontWeight: "700",
-    color: "#FFFFFF",
   },
   searchContainer: {
     minHeight: 49,
@@ -486,6 +564,22 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     borderBottomWidth: 1,
     borderBottomColor: "#E6EBE9",
+  },
+  avatarWrap: {
+    position: "relative",
+  },
+  groupBadge: {
+    position: "absolute",
+    right: -2,
+    bottom: -2,
+    width: 21,
+    height: 21,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: "#F7F8FA",
+    backgroundColor: "#176B5B",
   },
   conversationContent: {
     flex: 1,
@@ -573,20 +667,6 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 21,
     color: "#65706D",
-  },
-  emptyButton: {
-    minHeight: 48,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 7,
-    marginTop: 20,
-    paddingHorizontal: 18,
-    borderRadius: 13,
-    backgroundColor: "#176B5B",
-  },
-  emptyButtonText: {
-    fontWeight: "700",
-    color: "#FFFFFF",
   },
   pressed: {
     opacity: 0.78,

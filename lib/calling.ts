@@ -21,12 +21,15 @@ export type VoiceCall = {
   ended_at: string | null;
   expires_at: string | null;
   end_reason: string | null;
+  ringing_acknowledged_at: string | null;
+  caller_on_hold: boolean;
+  callee_on_hold: boolean;
   last_state_changed_at: string;
 };
 
 function friendlyCallError(message: string): Error {
   if (message.includes("USER_BUSY")) {
-    return new Error("This person is currently on another call.");
+    return new Error("User is busy.");
   }
 
   if (message.includes("INVALID_CALLEE")) {
@@ -105,3 +108,17 @@ export async function finishVoiceCall(
     throw error;
   }
 }
+
+export function isUserBusyError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String(error ?? "");
+
+  return (
+    message.includes("USER_BUSY") ||
+    message.toLowerCase().includes("currently on another call") ||
+    message.toLowerCase().includes("already on another call")
+  );
+}
+

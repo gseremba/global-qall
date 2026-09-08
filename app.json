@@ -1,13 +1,13 @@
 {
   "expo": {
-    "name": "global-qall",
+    "name": "Global Qall",
     "slug": "global-qall",
     "scheme": "globalqall",
     "platforms": [
       "ios",
       "android",
       "web"
-    ],	
+    ],
     "version": "1.0.0",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
@@ -24,7 +24,8 @@
           "audio",
           "voip",
           "remote-notification"
-        ]
+        ],
+        "CFBundleDisplayName": "Global Qall"
       },
       "bitcode": false,
       "entitlements": {
@@ -62,6 +63,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-notifications",
       [
         "expo-splash-screen",
         {
@@ -83,8 +85,8 @@
           "microphonePermission": "Global Qall uses your microphone to record and send voice messages."
         }
       ],
-      "expo-asset", 
-	  "./modules/global-qall-voip/app.plugin.js"
+      "expo-asset",
+      "./modules/global-qall-voip/app.plugin.js"
     ],
     "experiments": {
       "typedRoutes": true,

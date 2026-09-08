@@ -1,7 +1,9 @@
+﻿import { IncomingGroupCallProvider } from "../components/IncomingGroupCallProvider";
 import { Stack } from "expo-router";
 import { useEffect } from "react";
 import {
   ActivityIndicator,
+  Platform,
   StyleSheet,
   View,
 } from "react-native";
@@ -18,10 +20,19 @@ import {
   setVoipPushUser,
 } from "../lib/voipPush";
 
+import {
+  initializeMessagePushEvents,
+  registerMessagePushToken,
+} from "../lib/messagePush";
+
 function VoipPushRegistration() {
   const { session, loading } = useAuth();
 
   useEffect(() => {
+    if (Platform.OS !== "ios") {
+      return;
+    }
+
     let cleanup: (() => void) | undefined;
 
     try {
@@ -36,11 +47,35 @@ function VoipPushRegistration() {
   }, []);
 
   useEffect(() => {
-    if (loading) {
+    if (Platform.OS !== "ios" || loading) {
       return;
     }
 
     setVoipPushUser(session?.user?.id ?? null);
+  }, [session?.user?.id, loading]);
+
+  return null;
+}
+
+function MessagePushRegistration() {
+  const { session, loading } = useAuth();
+
+  useEffect(() => {
+    const cleanup = initializeMessagePushEvents();
+    return cleanup;
+  }, []);
+
+  useEffect(() => {
+    if (
+      loading ||
+      !session?.user?.id
+    ) {
+      return;
+    }
+
+    registerMessagePushToken(
+      session.user.id
+    );
   }, [session?.user?.id, loading]);
 
   return null;
@@ -94,15 +129,18 @@ function RootNavigator() {
     </Stack>
   );
 }
-
 export default function RootLayout() {
   return (
     <AuthProvider>
-      <VoipPushRegistration />
+      <MessagePushRegistration />
 
-      <IncomingCallProvider>
-        <RootNavigator />
-      </IncomingCallProvider>
+      {Platform.OS === "ios" ? <VoipPushRegistration /> : null}
+
+      <IncomingGroupCallProvider>
+        <IncomingCallProvider>
+          <RootNavigator />
+        </IncomingCallProvider>
+      </IncomingGroupCallProvider>
     </AuthProvider>
   );
 }

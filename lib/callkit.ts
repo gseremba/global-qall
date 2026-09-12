@@ -15,7 +15,7 @@ export function setupCallKit(): Promise<boolean> {
         appName: "Global Qall",
         supportsVideo: true,
         maximumCallGroups: "1",
-        maximumCallsPerCallGroup: "1",
+        maximumCallsPerCallGroup: "2",
         includesCallsInRecents: false,
       },
 
@@ -40,21 +40,6 @@ export async function displayNativeIncomingCall(args: {
   hasVideo: boolean;
 }): Promise<void> {
   await setupCallKit();
-
-  if (Platform.OS === "android") {
-    const connectionService =
-      await RNCallKeep.supportConnectionService();
-
-    const phoneAccount =
-      await RNCallKeep.hasPhoneAccount();
-
-    console.log("[CALLKEEP ANDROID]", {
-      connectionService,
-      phoneAccount,
-      callId: args.callId,
-      callerName: args.callerName,
-    });
-  }
 
   RNCallKeep.displayIncomingCall(
     args.callId,

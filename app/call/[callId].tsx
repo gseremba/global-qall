@@ -10,6 +10,7 @@ import {
   Alert,
   AppState,
   Animated,
+  Modal,
   PanResponder,
   Pressable,
   SafeAreaView,
@@ -42,6 +43,15 @@ import {
   setNativeCallMuted,
   startNativeOutgoingCall,
 } from "../../lib/callkit";
+import {
+  clearWaitingCall,
+  subscribeToWaitingCall,
+  type WaitingCall,
+} from "../../lib/callWaiting";
+import {
+  isNativeCallHandoffFrom,
+  markNativeCallHandoffCleanupComplete,
+} from "../../lib/nativeCallHandoff";
 import { supabase } from "../../lib/supabase";
 
 const VOIP_SERVER_URL = (
@@ -236,6 +246,7 @@ export default function CallScreen() {
     callId?: string | string[];
     direction?: string | string[];
     nativeAction?: string | string[];
+    returnCallId?: string | string[];
   }>();
   const callId = Array.isArray(params.callId)
     ? params.callId[0]
@@ -243,6 +254,9 @@ export default function CallScreen() {
   const nativeAction = Array.isArray(params.nativeAction)
     ? params.nativeAction[0]
     : params.nativeAction;
+  const returnCallId = Array.isArray(params.returnCallId)
+    ? params.returnCallId[0]
+    : params.returnCallId;
 
   const [call, setCall] = useState<VoiceCall | null>(null);
   const [otherProfile, setOtherProfile] = useState<OtherProfile | null>(null);
@@ -250,6 +264,10 @@ export default function CallScreen() {
   const [preparing, setPreparing] = useState(false);
   const [muted, setMuted] = useState(false);
   const [holdUpdating, setHoldUpdating] = useState(false);
+  const [waitingCall, setWaitingCall] =
+    useState<WaitingCall | null>(null);
+  const [waitingActionBusy, setWaitingActionBusy] =
+    useState(false);
   const [speakerOn, setSpeakerOn] = useState(false);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [frontCamera, setFrontCamera] = useState(true);
@@ -338,7 +356,6 @@ export default function CallScreen() {
   const requestIceRestartRef = useRef<(() => void) | null>(null);
   const activeIceServersRef = useRef<IceServerConfig[]>([]);
   const speakerOnRef = useRef(false);
-  const cameraEnabledRef = useRef(true);
   const audioRecoveryTimerRef = useRef<
     ReturnType<typeof setTimeout> | null
   >(null);
@@ -369,6 +386,90 @@ export default function CallScreen() {
   const terminalNavigationTimerRef = useRef<
     ReturnType<typeof setTimeout> | null
   >(null);
+  const suppressTerminalNavigationRef = useRef(false);
+
+  const resumeReturnCall = useCallback(async () => {
+    if (!returnCallId || !user?.id) {
+      return;
+    }
+
+    try {
+      const { data: heldCall, error: heldCallError } = await supabase
+        .from("calls")
+        .select("id, caller_id, callee_id, status")
+        .eq("id", returnCallId)
+        .maybeSingle();
+
+      if (heldCallError) {
+        throw heldCallError;
+      }
+
+      if (!heldCall || heldCall.status !== "accepted") {
+        return;
+      }
+
+      const holdColumn =
+        heldCall.caller_id === user.id
+          ? "caller_on_hold"
+          : heldCall.callee_id === user.id
+            ? "callee_on_hold"
+            : null;
+
+      if (!holdColumn) {
+        return;
+      }
+
+      const { error: resumeError } = await supabase
+        .from("calls")
+        .update({ [holdColumn]: false })
+        .eq("id", returnCallId)
+        .eq("status", "accepted");
+
+      if (resumeError) {
+        throw resumeError;
+      }
+
+      console.log("[CALL WAITING]", {
+        callId,
+        returnCallId,
+        event: "held_call_resumed_before_return",
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      // Never strand navigation because resume bookkeeping failed. The user
+      // can still return to the first call and use its Resume control.
+      console.warn("[CALL WAITING]", {
+        callId,
+        returnCallId,
+        event: "held_call_auto_resume_failed",
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }, [callId, returnCallId, user?.id]);
+
+  const closeCurrentCallScreen = useCallback(async () => {
+    // Android app-level waiting-call switch or iOS CallKit "End & Accept":
+    // the old call is expected to become terminal. It must never pop the new
+    // call screen after the handoff has started.
+    if (
+      suppressTerminalNavigationRef.current ||
+      (callId ? isNativeCallHandoffFrom(callId) : false)
+    ) {
+      console.log("[CALL WAITING]", {
+        callId,
+        event: "terminal_navigation_suppressed_during_switch",
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    await resumeReturnCall();
+    closeCallScreen();
+  }, [callId, resumeReturnCall]);
 
   const recordCallDiagnostic = useCallback(
     async (
@@ -456,6 +557,20 @@ export default function CallScreen() {
     call && isCaller ? call.callee_on_hold : call?.caller_on_hold
   );
 
+  useEffect(() => {
+    return subscribeToWaitingCall((nextWaitingCall) => {
+      if (
+        nextWaitingCall &&
+        nextWaitingCall.activeCallId === callId
+      ) {
+        setWaitingCall(nextWaitingCall);
+        return;
+      }
+
+      setWaitingCall(null);
+    });
+  }, [callId]);
+
   const cleanupMedia = useCallback(() => {
     if (unansweredTimerRef.current) {
       clearTimeout(unansweredTimerRef.current);
@@ -482,6 +597,30 @@ export default function CallScreen() {
     InCallManager.stop();
     InCallManager.setForceSpeakerphoneOn(false);
   }, []);
+
+  const completeNativeHandoffCleanup = useCallback(() => {
+    if (!callId || !isNativeCallHandoffFrom(callId)) {
+      return false;
+    }
+
+    cleanupMedia();
+
+    if (terminalNavigationTimerRef.current) {
+      clearTimeout(terminalNavigationTimerRef.current);
+      terminalNavigationTimerRef.current = null;
+    }
+
+    setConnectionLabel("Switching calls…");
+    markNativeCallHandoffCleanupComplete(callId);
+
+    console.log("[NATIVE CALL HANDOFF]", {
+      callId,
+      event: "old_call_screen_cleanup_complete",
+      timestamp: new Date().toISOString(),
+    });
+
+    return true;
+  }, [callId, cleanupMedia]);
 
   const extractIceUfragFromSdp = useCallback(
     (sdp: string | null | undefined) => {
@@ -1980,7 +2119,7 @@ export default function CallScreen() {
                     ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
                     : CALLKIT_END_REASONS.REMOTE_ENDED,
             );
-            closeCallScreen();
+            void closeCurrentCallScreen();
             return;
           }
         }
@@ -2066,7 +2205,7 @@ export default function CallScreen() {
         return;
       }
 
-      closeCallScreen();
+      void closeCurrentCallScreen();
     },
     [callId, cleanupMedia, recordCallDiagnostic]
   );
@@ -2336,7 +2475,6 @@ export default function CallScreen() {
     setSpeakerOn(false);
     speakerOnRef.current = false;
     setCameraEnabled(true);
-    cameraEnabledRef.current = true;
     setFrontCamera(true);
     setElapsedSeconds(0);
     setConnectionLabel("Preparing call…");
@@ -2393,6 +2531,10 @@ export default function CallScreen() {
         });
 
         if (isTerminalCallStatus(loadedCall.status)) {
+          if (completeNativeHandoffCleanup()) {
+            return;
+          }
+
           cleanupMedia();
           endNativeCall(
             callId,
@@ -2404,7 +2546,7 @@ export default function CallScreen() {
                   ? CALLKIT_END_REASONS.DECLINED_ELSEWHERE
                   : CALLKIT_END_REASONS.REMOTE_ENDED,
           );
-          closeCallScreen();
+          void closeCurrentCallScreen();
           return;
         }
 
@@ -2845,10 +2987,7 @@ export default function CallScreen() {
   ]);
 
   useEffect(() => {
-    if (!callId || !user || !call) return;
-
-    const currentIsCaller = call.caller_id === user.id;
-    const currentIsVideoCall = call.call_type === "video";
+    if (!callId || !user) return;
 
     const callChannel = supabase
       .channel(`call-${callId}`)
@@ -2891,6 +3030,10 @@ export default function CallScreen() {
           }
 
           if (isTerminalCallStatus(updated.status)) {
+            if (completeNativeHandoffCleanup()) {
+              return;
+            }
+
             cleanupMedia();
             endNativeCall(
               callId,
@@ -2914,7 +3057,7 @@ export default function CallScreen() {
 
             terminalNavigationTimerRef.current = setTimeout(() => {
               terminalNavigationTimerRef.current = null;
-              closeCallScreen();
+              void closeCurrentCallScreen();
             }, 650);
           }
         },
@@ -2949,13 +3092,13 @@ export default function CallScreen() {
         if (status === "SUBSCRIBED") {
           callChannelRef.current = callChannel;
 
-          if (currentIsVideoCall) {
+          if (isVideoCall) {
             void callChannel.send({
               type: "broadcast",
               event: "camera-state",
               payload: {
                 user_id: user.id,
-                enabled: cameraEnabledRef.current,
+                enabled: cameraEnabled,
               },
             });
           }
@@ -2968,7 +3111,7 @@ export default function CallScreen() {
       void syncRemoteCandidates();
 
       if (
-        currentIsCaller &&
+        isCaller &&
         (
           !answerAppliedRef.current ||
           peerRef.current?.signalingState === "have-local-offer"
@@ -3004,11 +3147,12 @@ export default function CallScreen() {
     applyRemoteAnswer,
     handleRemoteIceRestartOffer,
     callId,
-    call?.caller_id,
-    call?.call_type,
     cleanupMedia,
+    cameraEnabled,
+    isCaller,
+    isVideoCall,
     syncRemoteCandidates,
-    user?.id,
+    user,
   ]);
 
   useEffect(() => {
@@ -3342,7 +3486,7 @@ export default function CallScreen() {
             callId,
             CALLKIT_END_REASONS.REMOTE_ENDED
           );
-          closeCallScreen();
+          void closeCurrentCallScreen();
           return;
         }
 
@@ -3372,6 +3516,9 @@ export default function CallScreen() {
         setCall(authoritativeCall);
 
         if (isTerminalCallStatus(authoritativeCall.status)) {
+          if (completeNativeHandoffCleanup()) {
+            return;
+          }
           if (!lifecycleSummaryWrittenRef.current) {
             lifecycleSummaryWrittenRef.current = true;
 
@@ -3457,7 +3604,7 @@ export default function CallScreen() {
 
           terminalNavigationTimerRef.current = setTimeout(() => {
             terminalNavigationTimerRef.current = null;
-            closeCallScreen();
+            void closeCurrentCallScreen();
           }, 650);
 
           return;
@@ -4646,6 +4793,222 @@ export default function CallScreen() {
     }
   }, [call, callId, holdUpdating, isCaller, localOnHold]);
 
+  const declineWaitingCall = useCallback(async () => {
+    if (!waitingCall || waitingActionBusy) {
+      return;
+    }
+
+    setWaitingActionBusy(true);
+
+    try {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await supabase
+        .from("calls")
+        .update({
+          status: "declined",
+          end_reason: "declined_call_waiting",
+          ended_at: nowIso,
+          last_state_changed_at: nowIso,
+        })
+        .eq("id", waitingCall.call.id)
+        .eq("status", "ringing")
+        .select("id")
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      if (data) {
+        await finishVoiceCall(
+          waitingCall.call.id,
+          "declined",
+          "declined_call_waiting"
+        );
+      }
+
+      clearWaitingCall(waitingCall.call.id);
+      setWaitingCall(null);
+    } catch (error) {
+      Alert.alert(
+        "Call waiting",
+        error instanceof Error
+          ? error.message
+          : "Could not decline the waiting call."
+      );
+    } finally {
+      setWaitingActionBusy(false);
+    }
+  }, [waitingActionBusy, waitingCall]);
+
+  const holdAndAnswerWaitingCall = useCallback(async () => {
+    if (
+      !waitingCall ||
+      !callId ||
+      !call ||
+      !user ||
+      call.status !== "accepted" ||
+      waitingActionBusy
+    ) {
+      return;
+    }
+
+    setWaitingActionBusy(true);
+
+    try {
+      const holdColumn =
+        call.caller_id === user.id
+          ? "caller_on_hold"
+          : "callee_on_hold";
+
+      const { data, error } = await supabase
+        .from("calls")
+        .update({ [holdColumn]: true })
+        .eq("id", callId)
+        .eq("status", "accepted")
+        .select("id, caller_on_hold, callee_on_hold")
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data) {
+        throw new Error("The current call is no longer active.");
+      }
+
+      setCall((current) =>
+        current
+          ? {
+              ...current,
+              caller_on_hold: Boolean(data.caller_on_hold),
+              callee_on_hold: Boolean(data.callee_on_hold),
+            }
+          : current
+      );
+
+      // Disable the current call's media immediately. The existing hold effect
+      // will keep these tracks disabled while the first call remains on hold.
+      localStreamRef.current
+        ?.getAudioTracks()
+        .forEach((track) => {
+          track.enabled = false;
+        });
+
+      localStreamRef.current
+        ?.getVideoTracks()
+        .forEach((track) => {
+          track.enabled = false;
+        });
+
+      const waitingCallId = waitingCall.call.id;
+      clearWaitingCall(waitingCallId);
+      setWaitingCall(null);
+
+      router.push({
+        pathname: "/call/[callId]",
+        params: {
+          callId: waitingCallId,
+          direction: "incoming",
+          nativeAction: "answer",
+          returnCallId: callId,
+        },
+      });
+    } catch (error) {
+      Alert.alert(
+        "Call waiting",
+        error instanceof Error
+          ? error.message
+          : "Could not hold the current call."
+      );
+    } finally {
+      setWaitingActionBusy(false);
+    }
+  }, [call, callId, user, waitingActionBusy, waitingCall]);
+
+  const endAndAnswerWaitingCall = useCallback(async () => {
+    if (
+      !waitingCall ||
+      !callId ||
+      call?.status !== "accepted" ||
+      waitingActionBusy
+    ) {
+      return;
+    }
+
+    setWaitingActionBusy(true);
+    suppressTerminalNavigationRef.current = true;
+
+    try {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await supabase
+        .from("calls")
+        .update({
+          status: "ended",
+          end_reason: "ended_for_waiting_call",
+          ended_at: nowIso,
+          last_state_changed_at: nowIso,
+        })
+        .eq("id", callId)
+        .eq("status", "accepted")
+        .select("id")
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data) {
+        throw new Error("The current call is no longer active.");
+      }
+
+      // Tear down only the current call after its authoritative transition has
+      // succeeded, then replace this route with the waiting call and auto-answer.
+      cleanupMedia();
+      endNativeCall(
+        callId,
+        CALLKIT_END_REASONS.REMOTE_ENDED
+      );
+
+      await finishVoiceCall(
+        callId,
+        "ended",
+        "ended_for_waiting_call"
+      );
+
+      const waitingCallId = waitingCall.call.id;
+      clearWaitingCall(waitingCallId);
+      setWaitingCall(null);
+
+      // Replace Call A with Call B only after Call A is terminal. Its
+      // Realtime terminal callback is suppressed above so it cannot pop B.
+      router.replace({
+        pathname: "/call/[callId]",
+        params: {
+          callId: waitingCallId,
+          direction: "incoming",
+          nativeAction: "answer",
+        },
+      });
+    } catch (error) {
+      suppressTerminalNavigationRef.current = false;
+      Alert.alert(
+        "Call waiting",
+        error instanceof Error
+          ? error.message
+          : "Could not switch to the waiting call."
+      );
+    } finally {
+      setWaitingActionBusy(false);
+    }
+  }, [
+    call?.status,
+    callId,
+    cleanupMedia,
+    waitingActionBusy,
+    waitingCall,
+  ]);
+
   function toggleMute() {
     const next = !muted;
 
@@ -4680,7 +5043,6 @@ export default function CallScreen() {
       });
 
     setCameraEnabled(next);
-    cameraEnabledRef.current = next;
 
     if (user && callChannelRef.current) {
       void callChannelRef.current.send({
@@ -4770,6 +5132,106 @@ export default function CallScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
+
+      <Modal
+        visible={Boolean(waitingCall)}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!waitingActionBusy) {
+            void declineWaitingCall();
+          }
+        }}
+      >
+        <View style={styles.callWaitingBackdrop}>
+          <View style={styles.callWaitingCard}>
+            <Text style={styles.callWaitingEyebrow}>
+              Incoming call
+            </Text>
+
+            <Text style={styles.callWaitingName}>
+              {waitingCall?.caller?.display_name?.trim() ||
+                waitingCall?.caller?.qall_id ||
+                "Global Qall caller"}
+            </Text>
+
+            <Text style={styles.callWaitingId}>
+              {waitingCall?.caller?.qall_id ?? "Global Qall"}
+            </Text>
+
+            <Text style={styles.callWaitingType}>
+              {waitingCall?.call.call_type === "video"
+                ? "Video call waiting"
+                : "Voice call waiting"}
+            </Text>
+
+            {waitingActionBusy ? (
+              <ActivityIndicator
+                size="large"
+                color="#FFFFFF"
+                style={styles.callWaitingSpinner}
+              />
+            ) : (
+              <View style={styles.callWaitingActions}>
+                <Pressable
+                  onPress={() => void declineWaitingCall()}
+                  style={[
+                    styles.callWaitingAction,
+                    styles.callWaitingDecline,
+                  ]}
+                >
+                  <Ionicons
+                    name="close"
+                    size={24}
+                    color="#FFFFFF"
+                  />
+                  <Text style={styles.callWaitingActionText}>
+                    Decline
+                  </Text>
+                </Pressable>
+
+                <Pressable
+                  onPress={() =>
+                    void holdAndAnswerWaitingCall()
+                  }
+                  style={[
+                    styles.callWaitingAction,
+                    styles.callWaitingHold,
+                  ]}
+                >
+                  <Ionicons
+                    name="pause"
+                    size={22}
+                    color="#FFFFFF"
+                  />
+                  <Text style={styles.callWaitingActionText}>
+                    Hold & Answer
+                  </Text>
+                </Pressable>
+
+                <Pressable
+                  onPress={() =>
+                    void endAndAnswerWaitingCall()
+                  }
+                  style={[
+                    styles.callWaitingAction,
+                    styles.callWaitingAnswer,
+                  ]}
+                >
+                  <Ionicons
+                    name="call"
+                    size={22}
+                    color="#FFFFFF"
+                  />
+                  <Text style={styles.callWaitingActionText}>
+                    End & Answer
+                  </Text>
+                </Pressable>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       <SafeAreaView style={styles.safeArea}>
         {isVideoCall && !incomingWaiting ? (
@@ -5263,6 +5725,82 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
   },
   disabled: { opacity: 0.5 },
+
+  callWaitingBackdrop: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 22,
+    backgroundColor: "rgba(0,0,0,0.58)",
+  },
+  callWaitingCard: {
+    width: "100%",
+    maxWidth: 430,
+    paddingHorizontal: 22,
+    paddingTop: 26,
+    paddingBottom: 22,
+    borderRadius: 24,
+    backgroundColor: "#173C35",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  callWaitingEyebrow: {
+    fontSize: 14,
+    fontWeight: "700",
+    textAlign: "center",
+    color: "#BFD8D1",
+  },
+  callWaitingName: {
+    marginTop: 9,
+    fontSize: 25,
+    fontWeight: "800",
+    textAlign: "center",
+    color: "#FFFFFF",
+  },
+  callWaitingId: {
+    marginTop: 5,
+    fontSize: 14,
+    textAlign: "center",
+    color: "#BFD8D1",
+  },
+  callWaitingType: {
+    marginTop: 10,
+    fontSize: 15,
+    fontWeight: "600",
+    textAlign: "center",
+    color: "#FFFFFF",
+  },
+  callWaitingSpinner: {
+    marginTop: 26,
+    marginBottom: 8,
+  },
+  callWaitingActions: {
+    marginTop: 24,
+    gap: 10,
+  },
+  callWaitingAction: {
+    minHeight: 52,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+  },
+  callWaitingDecline: {
+    backgroundColor: "#B42318",
+  },
+  callWaitingHold: {
+    backgroundColor: "#8A6116",
+  },
+  callWaitingAnswer: {
+    backgroundColor: "#16875C",
+  },
+  callWaitingActionText: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
 
   videoStage: {
     ...StyleSheet.absoluteFillObject,

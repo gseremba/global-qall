@@ -19,6 +19,12 @@ import {
   RNCallKeep,
   setupCallKit,
 } from "../lib/callkit";
+import { publishWaitingCall } from "../lib/callWaiting";
+import {
+  beginNativeCallHandoff,
+  clearNativeCallHandoff,
+  waitForNativeCallHandoffCleanup,
+} from "../lib/nativeCallHandoff";
 import { supabase } from "../lib/supabase";
 
 type CallerProfile = {
@@ -115,6 +121,67 @@ export function IncomingCallProvider({
 
       try {
         if (Platform.OS === "android") {
+          // Sprint 12.4B: keep the proven first-incoming-call route intact.
+          // Only divert a NEW ringing call when this user already has an
+          // accepted direct call. If this lookup fails, fall through to the
+          // existing router.push path so a database/network error can never
+          // suppress a normal Android incoming call.
+          let activeAcceptedCallId: string | null = null;
+
+          try {
+            const { data: activeCall, error: activeCallError } =
+              await supabase
+                .from("calls")
+                .select("id")
+                .eq("status", "accepted")
+                .neq("id", call.id)
+                .or(
+                  `caller_id.eq.${user.id},callee_id.eq.${user.id}`
+                )
+                .order("answered_at", { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+            if (activeCallError) {
+              console.warn("[CALL WAITING]", {
+                callId: call.id,
+                event: "active_call_lookup_failed_fallback_normal_route",
+                error: activeCallError.message,
+                timestamp: new Date().toISOString(),
+              });
+            } else {
+              activeAcceptedCallId = activeCall?.id ?? null;
+            }
+          } catch (error) {
+            console.warn("[CALL WAITING]", {
+              callId: call.id,
+              event: "active_call_lookup_exception_fallback_normal_route",
+              error:
+                error instanceof Error
+                  ? error.message
+                  : String(error),
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          if (activeAcceptedCallId) {
+            console.log("[CALL WAITING]", {
+              activeCallId: activeAcceptedCallId,
+              waitingCallId: call.id,
+              event: "second_incoming_call_queued",
+              timestamp: new Date().toISOString(),
+            });
+
+            publishWaitingCall({
+              activeCallId: activeAcceptedCallId,
+              call,
+              caller: profile,
+            });
+
+            await acknowledgeIncomingCall(call.id);
+            return;
+          }
+
           console.log("[INCOMING CALL] Android foreground route", {
             callId: call.id,
             callType: call.call_type,
@@ -181,9 +248,64 @@ export function IncomingCallProvider({
       }
     };
 
+    const findOtherAcceptedCall = async (
+      incomingCallId: string,
+    ): Promise<string | null> => {
+      const { data, error } = await supabase
+        .from("calls")
+        .select("id")
+        .eq("status", "accepted")
+        .neq("id", incomingCallId)
+        .or(
+          `caller_id.eq.${user.id},callee_id.eq.${user.id}`
+        )
+        .order("answered_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        console.warn("[NATIVE CALL HANDOFF]", {
+          incomingCallId,
+          event: "active_call_lookup_failed",
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return null;
+      }
+
+      return data?.id ?? null;
+    };
+
+    const findWaitingIncomingCall = async (
+      endingCallId: string,
+    ): Promise<string | null> => {
+      const { data, error } = await supabase
+        .from("calls")
+        .select("id")
+        .eq("callee_id", user.id)
+        .eq("status", "ringing")
+        .neq("id", endingCallId)
+        .gt("expires_at", new Date().toISOString())
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        console.warn("[NATIVE CALL HANDOFF]", {
+          endingCallId,
+          event: "waiting_call_lookup_failed",
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return null;
+      }
+
+      return data?.id ?? null;
+    };
+
     const answerListener = RNCallKeep.addEventListener(
       "answerCall",
-      ({ callUUID }) => {
+      async ({ callUUID }) => {
         if (answeredCallIdsRef.current.has(callUUID)) {
           console.log("[CALL RACE]", {
             callId: callUUID,
@@ -194,6 +316,65 @@ export function IncomingCallProvider({
         }
 
         answeredCallIdsRef.current.add(callUUID);
+
+        // iOS "End & Accept" can deliver endCall and answerCall almost
+        // back-to-back. Ensure the previous accepted call has completed its
+        // local media cleanup before the new call screen starts InCallManager.
+        if (Platform.OS === "ios") {
+          const previousAcceptedCallId =
+            await findOtherAcceptedCall(callUUID);
+
+          if (previousAcceptedCallId) {
+            beginNativeCallHandoff(
+              previousAcceptedCallId,
+              callUUID,
+            );
+
+            const nowIso = new Date().toISOString();
+
+            const { error: endPreviousError } = await supabase
+              .from("calls")
+              .update({
+                status: "ended",
+                end_reason: "ended_for_callkit_waiting_call",
+                ended_at: nowIso,
+                last_state_changed_at: nowIso,
+              })
+              .eq("id", previousAcceptedCallId)
+              .eq("status", "accepted");
+
+            if (endPreviousError) {
+              console.warn("[NATIVE CALL HANDOFF]", {
+                fromCallId: previousAcceptedCallId,
+                toCallId: callUUID,
+                event: "previous_call_end_failed",
+                error: endPreviousError.message,
+                timestamp: new Date().toISOString(),
+              });
+            }
+
+            await waitForNativeCallHandoffCleanup(
+              previousAcceptedCallId,
+            );
+
+            router.replace({
+              pathname: "/call/[callId]",
+              params: {
+                callId: callUUID,
+                direction: "incoming",
+                nativeAction: "answer",
+              },
+            });
+
+            // Keep the marker briefly so stale callbacks from the old screen
+            // remain suppressed while the replacement screen initializes.
+            setTimeout(() => {
+              clearNativeCallHandoff(callUUID);
+            }, 2000);
+
+            return;
+          }
+        }
 
         router.push({
           pathname: "/call/[callId]",
@@ -248,6 +429,21 @@ export function IncomingCallProvider({
           }
 
           const wasRinging = data.status === "ringing";
+
+          if (
+            Platform.OS === "ios" &&
+            data.status === "accepted"
+          ) {
+            const waitingCallId =
+              await findWaitingIncomingCall(callUUID);
+
+            if (waitingCallId) {
+              beginNativeCallHandoff(
+                callUUID,
+                waitingCallId,
+              );
+            }
+          }
 
           await finishVoiceCall(
             callUUID,

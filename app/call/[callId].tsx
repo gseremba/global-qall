@@ -5192,25 +5192,6 @@ export default function CallScreen() {
 
                 <Pressable
                   onPress={() =>
-                    void holdAndAnswerWaitingCall()
-                  }
-                  style={[
-                    styles.callWaitingAction,
-                    styles.callWaitingHold,
-                  ]}
-                >
-                  <Ionicons
-                    name="pause"
-                    size={22}
-                    color="#FFFFFF"
-                  />
-                  <Text style={styles.callWaitingActionText}>
-                    Hold & Answer
-                  </Text>
-                </Pressable>
-
-                <Pressable
-                  onPress={() =>
                     void endAndAnswerWaitingCall()
                   }
                   style={[
@@ -5224,7 +5205,7 @@ export default function CallScreen() {
                     color="#FFFFFF"
                   />
                   <Text style={styles.callWaitingActionText}>
-                    End & Answer
+                    End & Accept
                   </Text>
                 </Pressable>
               </View>
@@ -5776,9 +5757,11 @@ const styles = StyleSheet.create({
   },
   callWaitingActions: {
     marginTop: 24,
-    gap: 10,
+    flexDirection: "row",
+    gap: 12,
   },
   callWaitingAction: {
+    flex: 1,
     minHeight: 52,
     flexDirection: "row",
     alignItems: "center",

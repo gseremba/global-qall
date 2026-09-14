@@ -46,3 +46,4 @@ app-example
 
 .env
 .env
+global-qall-firebase-adminsdk-*.json

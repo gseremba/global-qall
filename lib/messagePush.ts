@@ -35,6 +35,30 @@ function openNotificationData(
   if (!data) return;
 
   const type = String(data.type ?? "");
+
+  if (type === "direct_call") {
+    const callId = String(data.callId ?? "");
+
+    if (!callId) {
+      return;
+    }
+
+    console.log("[DIRECT CALL PUSH] Opening incoming call", {
+      callId,
+      appState: AppState.currentState,
+    });
+
+    router.push({
+      pathname: "/call/[callId]",
+      params: {
+        callId,
+        direction: "incoming",
+      },
+    });
+
+    return;
+  }
+
   const conversationId = String(
     data.conversationId ?? ""
   );
@@ -59,6 +83,21 @@ export function initializeMessagePushEvents() {
         const data =
           notification.request.content
             .data as Record<string, unknown>;
+
+        const notificationType =
+          String(data?.type ?? "");
+
+        if (
+          notificationType === "direct_call" &&
+          AppState.currentState === "active"
+        ) {
+          return {
+            shouldPlaySound: false,
+            shouldSetBadge: false,
+            shouldShowBanner: false,
+            shouldShowList: false,
+          };
+        }
 
         const notificationConversationId =
           String(data?.conversationId ?? "");
@@ -151,12 +190,36 @@ async function configureAndroidChannel() {
         Notifications.AndroidNotificationVisibility.PUBLIC,
     }
   );
+
+  await Notifications.setNotificationChannelAsync(
+    "calls",
+    {
+      name: "Incoming calls",
+      description:
+        "Incoming Global Qall voice and video calls",
+      importance:
+        Notifications.AndroidImportance.MAX,
+      sound: "default",
+      vibrationPattern: [0, 300, 180, 300, 180, 500],
+      lockscreenVisibility:
+        Notifications.AndroidNotificationVisibility.PUBLIC,
+    }
+  );
 }
 
 export async function registerMessagePushToken(
   userId: string
 ): Promise<string | null> {
+  console.log("[MESSAGE PUSH] register start", {
+    userId,
+    platform: Platform.OS,
+  });
+
   const projectId = getProjectId();
+
+  console.log("[MESSAGE PUSH] projectId", {
+    projectId,
+  });
 
   if (!projectId) {
     console.warn(
@@ -168,8 +231,14 @@ export async function registerMessagePushToken(
   try {
     await configureAndroidChannel();
 
+    console.log("[MESSAGE PUSH] channel configured");
+
     const currentPermissions =
       await Notifications.getPermissionsAsync();
+
+    console.log("[MESSAGE PUSH] current permission", {
+      status: currentPermissions.status,
+    });
 
     let finalStatus = currentPermissions.status;
 
@@ -178,6 +247,10 @@ export async function registerMessagePushToken(
         await Notifications.requestPermissionsAsync();
 
       finalStatus = requested.status;
+
+      console.log("[MESSAGE PUSH] requested permission", {
+        status: finalStatus,
+      });
     }
 
     if (finalStatus !== "granted") {
@@ -192,9 +265,14 @@ export async function registerMessagePushToken(
         projectId,
       });
 
+    console.log("[MESSAGE PUSH] token result", {
+      token: tokenResult.data,
+    });
+
     const expoPushToken = tokenResult.data;
 
     if (!expoPushToken) {
+      console.warn("[MESSAGE PUSH] No Expo token returned");
       return null;
     }
 
@@ -215,6 +293,11 @@ export async function registerMessagePushToken(
         }
       );
 
+    console.log("[MESSAGE PUSH] upsert result", {
+      error: error?.message ?? null,
+      code: error?.code ?? null,
+    });
+
     if (error) {
       throw error;
     }
@@ -226,7 +309,6 @@ export async function registerMessagePushToken(
 
     return expoPushToken;
   } catch (error) {
-    // Push registration should never prevent app startup.
     console.warn(
       "[MESSAGE PUSH] Registration failed:",
       error instanceof Error

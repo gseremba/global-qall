@@ -55,7 +55,8 @@
         "android.permission.WAKE_LOCK",
         "android.permission.BLUETOOTH"
       ],
-      "package": "com.gseremba.globalqall"
+      "package": "com.gseremba.globalqall",
+	  "googleServicesFile": "./google-services.json"
     },
     "web": {
       "output": "static",

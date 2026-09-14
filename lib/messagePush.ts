@@ -3,6 +3,7 @@ import * as Notifications from "expo-notifications";
 import { router } from "expo-router";
 import { AppState, Platform } from "react-native";
 
+import { claimIncomingCallRoute } from "./incomingCallRouteGuard";
 import { supabase } from "./supabase";
 
 let configured = false;
@@ -47,6 +48,10 @@ function openNotificationData(
       callId,
       appState: AppState.currentState,
     });
+
+    if (!claimIncomingCallRoute(callId)) {
+      return;
+    }
 
     router.push({
       pathname: "/call/[callId]",
@@ -210,16 +215,7 @@ async function configureAndroidChannel() {
 export async function registerMessagePushToken(
   userId: string
 ): Promise<string | null> {
-  console.log("[MESSAGE PUSH] register start", {
-    userId,
-    platform: Platform.OS,
-  });
-
   const projectId = getProjectId();
-
-  console.log("[MESSAGE PUSH] projectId", {
-    projectId,
-  });
 
   if (!projectId) {
     console.warn(
@@ -231,14 +227,8 @@ export async function registerMessagePushToken(
   try {
     await configureAndroidChannel();
 
-    console.log("[MESSAGE PUSH] channel configured");
-
     const currentPermissions =
       await Notifications.getPermissionsAsync();
-
-    console.log("[MESSAGE PUSH] current permission", {
-      status: currentPermissions.status,
-    });
 
     let finalStatus = currentPermissions.status;
 
@@ -247,10 +237,6 @@ export async function registerMessagePushToken(
         await Notifications.requestPermissionsAsync();
 
       finalStatus = requested.status;
-
-      console.log("[MESSAGE PUSH] requested permission", {
-        status: finalStatus,
-      });
     }
 
     if (finalStatus !== "granted") {
@@ -265,14 +251,9 @@ export async function registerMessagePushToken(
         projectId,
       });
 
-    console.log("[MESSAGE PUSH] token result", {
-      token: tokenResult.data,
-    });
-
     const expoPushToken = tokenResult.data;
 
     if (!expoPushToken) {
-      console.warn("[MESSAGE PUSH] No Expo token returned");
       return null;
     }
 
@@ -293,11 +274,6 @@ export async function registerMessagePushToken(
         }
       );
 
-    console.log("[MESSAGE PUSH] upsert result", {
-      error: error?.message ?? null,
-      code: error?.code ?? null,
-    });
-
     if (error) {
       throw error;
     }
@@ -309,6 +285,7 @@ export async function registerMessagePushToken(
 
     return expoPushToken;
   } catch (error) {
+    // Push registration should never prevent app startup.
     console.warn(
       "[MESSAGE PUSH] Registration failed:",
       error instanceof Error

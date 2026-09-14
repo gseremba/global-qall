@@ -305,6 +305,9 @@ export default function CallScreen() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const callChannelRef = useRef<any>(null);
+  const realtimeChannelInstanceRef = useRef(
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  );
   const remoteDescriptionReadyRef = useRef(false);
   const pendingCandidatesRef = useRef<Record<string, unknown>[]>([]);
   const offerCreatedRef = useRef(false);
@@ -2990,7 +2993,7 @@ export default function CallScreen() {
     if (!callId || !user) return;
 
     const callChannel = supabase
-      .channel(`call-${callId}`)
+      .channel(`call-${callId}-${realtimeChannelInstanceRef.current}`)
       .on(
         "postgres_changes",
         {

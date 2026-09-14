@@ -20,6 +20,7 @@ import {
   setupCallKit,
 } from "../lib/callkit";
 import { publishWaitingCall } from "../lib/callWaiting";
+import { claimIncomingCallRoute } from "../lib/incomingCallRouteGuard";
 import {
   beginNativeCallHandoff,
   clearNativeCallHandoff,
@@ -187,13 +188,15 @@ export function IncomingCallProvider({
             callType: call.call_type,
           });
 
-          router.push({
-            pathname: "/call/[callId]",
-            params: {
-              callId: call.id,
-              direction: "incoming",
-            },
-          });
+          if (claimIncomingCallRoute(call.id)) {
+            router.push({
+              pathname: "/call/[callId]",
+              params: {
+                callId: call.id,
+                direction: "incoming",
+              },
+            });
+          }
 
           await acknowledgeIncomingCall(call.id);
           return;

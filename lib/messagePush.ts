@@ -3,6 +3,12 @@ import * as Notifications from "expo-notifications";
 import { router } from "expo-router";
 import { AppState, Platform } from "react-native";
 
+import {
+  registerAndroidNativeIncomingCallTask,
+} from "./androidIncomingCallTask";
+import {
+  prepareAndroidNativeCalling,
+} from "./callkit";
 import { claimIncomingCallRoute } from "./incomingCallRouteGuard";
 import { supabase } from "./supabase";
 
@@ -82,6 +88,20 @@ function openNotificationData(
 }
 
 export function initializeMessagePushEvents() {
+  if (Platform.OS === "android") {
+    void registerAndroidNativeIncomingCallTask();
+
+    void prepareAndroidNativeCalling().then(
+      (phoneAccountReady) => {
+        if (!phoneAccountReady) {
+          console.warn(
+            "[ANDROID CALLKEEP] Global Qall phone account is not enabled yet. Native incoming-call UI cannot appear until it is enabled."
+          );
+        }
+      }
+    );
+  }
+
   if (!configured) {
     Notifications.setNotificationHandler({
       handleNotification: async (notification) => {

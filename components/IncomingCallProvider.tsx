@@ -4,7 +4,7 @@ import {
   useEffect,
   useRef,
 } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import { useAuth } from "../contexts/AuthContext";
 import {
@@ -122,6 +122,23 @@ export function IncomingCallProvider({
 
       try {
         if (Platform.OS === "android") {
+          // Sprint 12.5B:
+          // Foreground Android keeps the proven React incoming-call screen.
+          // Background / locked Android is owned by the native ConnectionService
+          // path triggered from the headless FCM task. Never navigate the React
+          // screen here while backgrounded or we can race the native UI.
+          if (AppState.currentState !== "active") {
+            console.log("[INCOMING CALL]", {
+              callId: call.id,
+              event: "android_background_deferred_to_native_callkeep",
+              appState: AppState.currentState,
+              timestamp: new Date().toISOString(),
+            });
+
+            await acknowledgeIncomingCall(call.id);
+            return;
+          }
+
           // Sprint 12.4B: keep the proven first-incoming-call route intact.
           // Only divert a NEW ringing call when this user already has an
           // accepted direct call. If this lookup fails, fall through to the
@@ -181,6 +198,29 @@ export function IncomingCallProvider({
 
             await acknowledgeIncomingCall(call.id);
             return;
+          }
+
+          try {
+            const nativeManagedCallActive =
+              await RNCallKeep.checkIsInManagedCall();
+
+            if (nativeManagedCallActive) {
+              console.log("[INCOMING CALL]", {
+                callId: call.id,
+                event: "android_native_call_already_active_skip_foreground_route",
+                timestamp: new Date().toISOString(),
+              });
+
+              await acknowledgeIncomingCall(call.id);
+              return;
+            }
+          } catch (nativeStateError) {
+            console.warn(
+              "[INCOMING CALL] Could not inspect Android managed-call state:",
+              nativeStateError instanceof Error
+                ? nativeStateError.message
+                : String(nativeStateError)
+            );
           }
 
           console.log("[INCOMING CALL] Android foreground route", {

@@ -22,15 +22,63 @@ export function setupCallKit(): Promise<boolean> {
       android: {
         alertTitle: "Calling permission",
         alertDescription:
-          "Global Qall needs access to phone calling services.",
+          "Global Qall needs access to Android calling services so incoming calls can appear while the app is locked or in the background.",
         cancelButton: "Cancel",
         okButton: "Allow",
         additionalPermissions: [],
+        foregroundService: {
+          channelId: "global-qall-active-call",
+          channelName: "Global Qall active calls",
+          notificationTitle: "Global Qall call in progress",
+          notificationIcon: "ic_launcher",
+        },
       },
     });
   }
 
   return setupPromise;
+}
+
+export async function prepareAndroidNativeCalling(): Promise<boolean> {
+  if (Platform.OS !== "android") {
+    return true;
+  }
+
+  try {
+    await setupCallKit();
+
+    RNCallKeep.setAvailable(true);
+    RNCallKeep.canMakeMultipleCalls(true);
+
+    const supported =
+      await RNCallKeep.supportConnectionService();
+
+    if (!supported) {
+      console.warn(
+        "[ANDROID CALLKEEP] ConnectionService is not supported on this device."
+      );
+      return false;
+    }
+
+    const enabled =
+      await RNCallKeep.hasPhoneAccount();
+
+    console.log("[ANDROID CALLKEEP] Phone account readiness", {
+      supported,
+      enabled,
+    });
+
+    return enabled;
+  } catch (error) {
+    console.warn(
+      "[ANDROID CALLKEEP] Could not prepare native calling:",
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+
+    return false;
+  }
 }
 
 export async function displayNativeIncomingCall(args: {

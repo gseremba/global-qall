@@ -56,7 +56,7 @@
         "android.permission.BLUETOOTH"
       ],
       "package": "com.gseremba.globalqall",
-	  "googleServicesFile": "./google-services.json"
+      "googleServicesFile": "./google-services.json"
     },
     "web": {
       "output": "static",
@@ -87,7 +87,8 @@
         }
       ],
       "expo-asset",
-      "./modules/global-qall-voip/app.plugin.js"
+      "./modules/global-qall-voip/app.plugin.js",
+      "./plugins/withAndroidFullScreenCall.js"
     ],
     "experiments": {
       "typedRoutes": true,

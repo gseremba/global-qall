@@ -4,9 +4,6 @@ import { router } from "expo-router";
 import { AppState, Platform } from "react-native";
 
 import {
-  registerAndroidNativeIncomingCallTask,
-} from "./androidIncomingCallTask";
-import {
   prepareAndroidNativeCalling,
 } from "./callkit";
 import { claimIncomingCallRoute } from "./incomingCallRouteGuard";
@@ -89,7 +86,7 @@ function openNotificationData(
 
 export function initializeMessagePushEvents() {
   if (Platform.OS === "android") {
-    void registerAndroidNativeIncomingCallTask();
+    
 
     void prepareAndroidNativeCalling().then(
       (phoneAccountReady) => {
@@ -232,6 +229,46 @@ async function configureAndroidChannel() {
   );
 }
 
+async function registerAndroidFcmToken(userId: string) {
+  if (Platform.OS !== "android") return;
+
+  try {
+    const {
+      getMessaging,
+      getToken,
+    } = await import("@react-native-firebase/messaging");
+
+    const firebaseMessaging = getMessaging();
+    const fcmToken = await getToken(firebaseMessaging);
+    if (!fcmToken) return;
+
+    const { error } = await supabase
+      .from("android_fcm_tokens")
+      .upsert(
+        {
+          user_id: userId,
+          fcm_token: fcmToken,
+          is_active: true,
+          last_registered_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "fcm_token" },
+      );
+
+    if (error) throw error;
+
+    console.log("[ANDROID FCM] Registered", {
+      tokenSuffix: fcmToken.slice(-12),
+    });
+  } catch (error) {
+    // Keep the existing Expo token path alive as a fallback.
+    console.warn(
+      "[ANDROID FCM] Registration failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export async function registerMessagePushToken(
   userId: string
 ): Promise<string | null> {
@@ -246,6 +283,10 @@ export async function registerMessagePushToken(
 
   try {
     await configureAndroidChannel();
+
+    if (Platform.OS === "android") {
+      await registerAndroidFcmToken(userId);
+    }
 
     const currentPermissions =
       await Notifications.getPermissionsAsync();

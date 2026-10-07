@@ -47,6 +47,24 @@ function formatWhen(value: string): string {
   });
 }
 
+function formatDuration(item: HistoryItem): string | null {
+  if (!item.answered_at || !item.ended_at) return null;
+
+  const startedAt = new Date(item.answered_at).getTime();
+  const endedAt = new Date(item.ended_at).getTime();
+  const totalSeconds = Math.max(0, Math.floor((endedAt - startedAt) / 1000));
+
+  if (!Number.isFinite(totalSeconds)) return null;
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function statusLabel(item: HistoryItem): string {
   if (
     item.status === "missed" &&
@@ -384,6 +402,7 @@ export default function CallHistoryScreen() {
               const missed =
                 item.status === "missed" &&
                 item.direction === "incoming";
+              const duration = formatDuration(item);
 
               return (
                 <View style={styles.row}>
@@ -425,9 +444,7 @@ export default function CallHistoryScreen() {
                           missed && styles.missed,
                         ]}
                       >
-                        {item.call_type === "video"
-                          ? `Video · ${statusLabel(item)}`
-                          : `Voice · ${statusLabel(item)}`}
+                        {`${item.call_type === "video" ? "Video" : "Voice"} · ${statusLabel(item)}${duration ? ` · ${duration}` : ""}`}
                       </Text>
                     </View>
 
@@ -441,7 +458,11 @@ export default function CallHistoryScreen() {
                     style={styles.callButton}
                   >
                     <Ionicons
-                      name="call-outline"
+                      name={
+                        item.call_type === "video"
+                          ? "videocam-outline"
+                          : "call-outline"
+                      }
                       size={22}
                       color="#176B5B"
                     />

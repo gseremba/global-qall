@@ -7,6 +7,7 @@ import {
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   FlatList,
   Pressable,
   RefreshControl,
@@ -119,7 +120,10 @@ export default function CallHistoryScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] =
-    useState<"all" | "missed">("all");
+    useState<"all" | "missed" | "incoming" | "outgoing">("all");
+
+  const [selected, setSelected] = useState<HistoryItem | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const loadHistory = useCallback(async () => {
     if (!user) {
@@ -144,7 +148,13 @@ export default function CallHistoryScreen() {
         throw error;
       }
 
-      const callRows = (calls ?? []) as VoiceCall[];
+      const { data: hidden, error: hiddenError } = await supabase
+        .from("call_history_hidden")
+        .select("call_id")
+        .eq("user_id", user.id);
+      if (hiddenError) throw hiddenError;
+      const hiddenIds = new Set((hidden ?? []).map((row) => row.call_id));
+      const callRows = ((calls ?? []) as VoiceCall[]).filter((call) => !hiddenIds.has(call.id));
       const otherIds = Array.from(
         new Set(
           callRows.map((call) =>
@@ -272,8 +282,44 @@ export default function CallHistoryScreen() {
       item.direction === "incoming"
   );
 
-  const displayedItems =
-    filter === "missed" ? missedItems : items;
+  const displayedItems = items.filter((item) =>
+    filter === "all" ||
+    (filter === "missed" && item.status === "missed" && item.direction === "incoming") ||
+    filter === item.direction
+  );
+
+  async function hideCalls(callIds: string[]) {
+    if (!user || busy || callIds.length === 0) return;
+    setBusy(true);
+    try {
+      const { error } = await supabase.from("call_history_hidden").upsert(
+        callIds.map((call_id) => ({ user_id: user.id, call_id })),
+        { onConflict: "user_id,call_id" }
+      );
+      if (error) throw error;
+      setSelected(null);
+      await loadHistory();
+    } catch (error) {
+      Alert.alert("Call history error", error instanceof Error ? error.message : "Could not update history.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmHide(item: HistoryItem) {
+    Alert.alert("Delete from history?", "This call will be hidden only from your history.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Delete", style: "destructive", onPress: () => void hideCalls([item.id]) },
+    ]);
+  }
+
+  function confirmClear() {
+    if (!items.length || busy) return;
+    Alert.alert("Clear call history?", "All displayed and filtered calls will be hidden from your history only. This cannot be undone.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Clear history", style: "destructive", onPress: () => void hideCalls(items.map((item) => item.id)) },
+    ]);
+  }
 
   async function callAgain(item: HistoryItem) {
     try {
@@ -323,7 +369,9 @@ export default function CallHistoryScreen() {
 
           <Text style={styles.heading}>Call History</Text>
 
-          <View style={styles.headerSpacer} />
+          <Pressable onPress={confirmClear} disabled={busy || items.length === 0} style={styles.headerSpacer} accessibilityLabel="Clear call history">
+            <Ionicons name="trash-outline" size={21} color={items.length ? "#B42318" : "#AAB2AF"} />
+          </Pressable>
         </View>
 
         <View style={styles.filters}>
@@ -367,6 +415,11 @@ export default function CallHistoryScreen() {
                 : ""}
             </Text>
           </Pressable>
+          {(["incoming", "outgoing"] as const).map((value) => (
+            <Pressable key={value} onPress={() => setFilter(value)} style={[styles.filterButton, filter === value && styles.filterButtonActive]}>
+              <Text style={[styles.filterText, filter === value && styles.filterTextActive]}>{value === "incoming" ? "Incoming" : "Outgoing"}</Text>
+            </Pressable>
+          ))}
         </View>
 
         {loading ? (
@@ -421,6 +474,7 @@ export default function CallHistoryScreen() {
 
               return (
                 <View style={styles.row}>
+                  <Pressable onPress={() => setSelected(item)} style={styles.rowMain} accessibilityLabel={`View details for ${item.other_name}`}>
                   <UserAvatar
                     avatarUrl={item.other_avatar_url}
                     name={item.other_name}
@@ -468,6 +522,7 @@ export default function CallHistoryScreen() {
                     </Text>
                   </View>
 
+                  </Pressable>
                   <Pressable
                     onPress={() => void callAgain(item)}
                     style={styles.callButton}
@@ -487,6 +542,26 @@ export default function CallHistoryScreen() {
             }}
           />
         )}
+        <Modal visible={selected !== null} transparent animationType="fade" onRequestClose={() => setSelected(null)}>
+          <View style={styles.modalBackdrop}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Call details</Text>
+              {selected && <>
+                <Text style={styles.modalName}>{selected.other_name}</Text>
+                <Text style={styles.modalLine}>Qall ID: {selected.other_qall_id || "Unavailable"}</Text>
+                <Text style={styles.modalLine}>Type: {selected.call_type === "video" ? "Video" : "Voice"}</Text>
+                <Text style={styles.modalLine}>Direction: {selected.direction}</Text>
+                <Text style={styles.modalLine}>Status: {statusLabel(selected)}</Text>
+                <Text style={styles.modalLine}>Date: {new Date(selected.created_at).toLocaleString()}</Text>
+                <Text style={styles.modalLine}>Duration: {formatDuration(selected) ?? "Not connected"}</Text>
+                <View style={styles.modalActions}>
+                  <Pressable style={styles.modalAction} onPress={() => setSelected(null)}><Text>Close</Text></Pressable>
+                  <Pressable style={styles.modalAction} onPress={() => confirmHide(selected)} disabled={busy}><Text style={styles.missed}>Delete</Text></Pressable>
+                </View>
+              </>}
+            </View>
+          </View>
+        </Modal>
       </SafeAreaView>
     </>
   );
@@ -528,6 +603,7 @@ const styles = StyleSheet.create({
   filters: {
     flexDirection: "row",
     gap: 8,
+    flexWrap: "wrap",
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 2,
@@ -575,6 +651,14 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     backgroundColor: "#FFFFFF",
   },
+  rowMain: { flex: 1, flexDirection: "row", alignItems: "center" },
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.4)", justifyContent: "center", padding: 24 },
+  modalCard: { backgroundColor: "#FFFFFF", borderRadius: 18, padding: 22 },
+  modalTitle: { fontSize: 20, fontWeight: "800", marginBottom: 12, color: "#18201E" },
+  modalName: { fontSize: 17, fontWeight: "700", marginBottom: 8 },
+  modalLine: { fontSize: 14, marginBottom: 7, color: "#35433F" },
+  modalActions: { flexDirection: "row", justifyContent: "flex-end", gap: 24, marginTop: 18 },
+  modalAction: { padding: 8 },
   details: {
     flex: 1,
     marginLeft: 12,

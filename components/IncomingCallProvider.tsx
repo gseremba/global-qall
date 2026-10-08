@@ -397,6 +397,13 @@ export function IncomingCallProvider({
     const endListener = RNCallKeep.addEventListener(
       "endCall",
       async ({ callUUID }) => {
+		  
+        console.log("[NATIVE END NAV]", {
+          callUUID,
+          event: "callkeep_endCall_received",
+          timestamp: new Date().toISOString(),
+        });
+		  
         if (endingCallIdsRef.current.has(callUUID)) {
           console.log("[CALL RACE]", {
             callId: callUUID,
@@ -418,6 +425,13 @@ export function IncomingCallProvider({
           if (error) {
             throw error;
           }
+
+          console.log("[NATIVE END NAV]", {
+            callUUID,
+            event: "callkeep_end_status_checked",
+            status: data?.status ?? null,
+            timestamp: new Date().toISOString(),
+          });
 
           if (
             !data ||

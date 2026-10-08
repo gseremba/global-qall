@@ -1,10 +1,46 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
-import { Tabs } from "expo-router";
+import { useEffect } from "react";
+import { Tabs, useNavigation } from "expo-router";
 import { Platform } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function TabsLayout() {
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation();
+
+  useEffect(() => {
+    const logTabState = () => {
+      const rootState = navigation.getState();
+
+      const findTabState = (state: any): any => {
+        if (!state) return null;
+
+        if (state.type === "tab") {
+          return state;
+        }
+
+        const activeRoute = state.routes?.[state.index ?? 0];
+        return findTabState(activeRoute?.state);
+      };
+
+      const tabState = findTabState(rootState);
+
+      console.log("[TAB STATE]", {
+        index: tabState?.index ?? null,
+        activeRoute:
+          tabState?.routes?.[tabState?.index ?? 0]?.name ?? null,
+        routes:
+          tabState?.routes?.map((route: any) => route.name) ?? [],
+        timestamp: new Date().toISOString(),
+      });
+    };
+
+    logTabState();
+
+    const unsubscribe = navigation.addListener("state", logTabState);
+
+    return unsubscribe;
+  }, [navigation]);
 
   return (
     <Tabs

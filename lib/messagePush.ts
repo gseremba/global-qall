@@ -39,6 +39,19 @@ function openNotificationData(
   if (!data) return;
 
   const type = String(data.type ?? "");
+  
+  console.log("[PUSH NAV]", {
+    type,
+      conversationId: String(data.conversationId ?? ""),
+      callId: String(data.callId ?? ""),
+    appState: AppState.currentState,
+    timestamp: new Date().toISOString(),
+  });  
+
+  if (type === "missed_call") {
+    router.push("/calls");
+    return;
+  }
 
   if (type === "direct_call") {
     const callId = String(data.callId ?? "");

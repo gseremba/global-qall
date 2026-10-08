@@ -224,13 +224,23 @@ function terminalCallLabel(
   return "Call ended";
 }
 
-
+/*
 function closeCallScreen() {
   if (router.canGoBack()) {
     router.back();
   } else {
     router.replace("/chats");
   }
+}
+*/
+function closeCallScreen() {
+  console.log("[CALL NAV]", {
+    event: "closeCallScreen_reset_to_home",
+    timestamp: new Date().toISOString(),
+  });
+
+  router.dismissAll();
+  router.replace("/");
 }
 
 type OtherProfile = {
@@ -455,9 +465,16 @@ export default function CallScreen() {
   }, [callId, returnCallId, user?.id]);
 
   const closeCurrentCallScreen = useCallback(async () => {
+    console.log("[CALL NAV]", {
+      event: "closeCurrentCallScreen_entered",
+      callId: callId ?? null,
+      timestamp: new Date().toISOString(),
+    });
+
     // Android app-level waiting-call switch or iOS CallKit "End & Accept":
     // the old call is expected to become terminal. It must never pop the new
     // call screen after the handoff has started.
+	  
     if (
       suppressTerminalNavigationRef.current ||
       (callId ? isNativeCallHandoffFrom(callId) : false)
@@ -707,7 +724,11 @@ export default function CallScreen() {
 
   const addRemoteCandidate = useCallback(
     async (candidate: Record<string, unknown>) => {
-      if (!peerRef.current) {
+      // Snapshot the peer once. peerRef.current can be cleared asynchronously
+      // by cleanupMedia() while ICE processing is still running.
+      const peer = peerRef.current;
+
+      if (!peer) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
@@ -741,7 +762,7 @@ export default function CallScreen() {
           callId,
           event: "future_candidate_queued",
           expectedUfrag: extractIceUfragFromSdp(
-            peerRef.current.remoteDescription?.sdp
+            peer.remoteDescription?.sdp
           ),
           candidateUfrag:
             extractCandidateIceUfrag(candidate),
@@ -755,7 +776,7 @@ export default function CallScreen() {
           callId,
           event: "stale_candidate_ignored",
           expectedUfrag: extractIceUfragFromSdp(
-            peerRef.current.remoteDescription?.sdp
+            peer.remoteDescription?.sdp
           ),
           candidateUfrag:
             extractCandidateIceUfrag(candidate),
@@ -764,8 +785,15 @@ export default function CallScreen() {
         return;
       }
 
+      // The call may have been cleaned up while the async signaling path
+      // was running. Do not apply ICE to an obsolete peer.
+      if (peerRef.current !== peer) {
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+
       try {
-        await peerRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+        await peer.addIceCandidate(new RTCIceCandidate(candidate));
         appliedCandidateKeysRef.current.add(key);
       } catch (error) {
         console.warn("Could not add remote ICE candidate:", error);
@@ -781,7 +809,9 @@ export default function CallScreen() {
   );
 
   const flushCandidates = useCallback(async () => {
-    if (!peerRef.current || !remoteDescriptionReadyRef.current) {
+    const peer = peerRef.current;
+
+    if (!peer || !remoteDescriptionReadyRef.current) {
       return;
     }
 
@@ -798,7 +828,7 @@ export default function CallScreen() {
       attempted: queued.length,
       remaining: pendingCandidatesRef.current.length,
       currentUfrag: extractIceUfragFromSdp(
-        peerRef.current.remoteDescription?.sdp
+        peer.remoteDescription?.sdp
       ),
       timestamp: new Date().toISOString(),
     });

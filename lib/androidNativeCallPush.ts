@@ -70,6 +70,7 @@ async function displayIncomingCall(
   console.log("[ANDROID 12.5C] Full-screen incoming call displayed", { callId });
 }
 
+/*
 setBackgroundMessageHandler(getMessaging(), async (message: RemoteMessage) => {
   try {
     await displayIncomingCall(message);
@@ -80,6 +81,29 @@ setBackgroundMessageHandler(getMessaging(), async (message: RemoteMessage) => {
     );
   }
 });
+*/
+
+console.log("[ANDROID 12.5D] Registering FCM background handler");
+
+setBackgroundMessageHandler(getMessaging(), async (message: RemoteMessage) => {
+  console.log("[ANDROID 12.5D] FCM background handler invoked", {
+    messageId: message.messageId,
+    type: message.data?.type,
+    callId: message.data?.callId,
+  });
+
+  try {
+    await displayIncomingCall(message);
+  } catch (error) {
+    console.warn(
+      "[ANDROID 12.5C] Background incoming-call presentation failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+});
+
+console.log("[ANDROID 12.5D] FCM background handler registered");
+
 
 notifee.onBackgroundEvent(async ({ type, detail }) => {
   if (

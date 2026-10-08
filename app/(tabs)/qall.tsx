@@ -1,7 +1,8 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { useEffect, useMemo, useState } from "react";
 import { useAudioPlayer } from "expo-audio";
-import { router, useLocalSearchParams } from "expo-router";
+import { router, useLocalSearchParams, useFocusEffect } from "expo-router";
+import { useCallback } from "react";
 import {
   Alert,
   Pressable,
@@ -50,6 +51,37 @@ function formatQallId(value: string): string {
 }
 
 export default function QallScreen() {
+  const [unreadMissedCount, setUnreadMissedCount] = useState(0);
+  const refreshMissedCount = useCallback(async () => {
+    const { data: auth } = await supabase.auth.getUser();
+    const userId = auth.user?.id;
+    if (!userId) { setUnreadMissedCount(0); return; }
+    const { data: profile, error: profileError } = await supabase.from("profiles")
+      .select("call_history_last_viewed_at").eq("id", userId).maybeSingle();
+    if (profileError) { console.warn("[MISSED COUNT] Profile:", profileError.message); return; }
+    let query = supabase.from("calls").select("id", { count: "exact", head: true })
+      .eq("callee_id", userId).eq("status", "missed");
+    if (profile?.call_history_last_viewed_at) {
+      query = query.gt("created_at", profile.call_history_last_viewed_at);
+    }
+    const { count, error } = await query;
+    if (error) console.warn("[MISSED COUNT] Calls:", error.message);
+    else setUnreadMissedCount(count ?? 0);
+  }, []);
+  useFocusEffect(useCallback(() => { void refreshMissedCount(); }, [refreshMissedCount]));
+  useEffect(() => {
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let cancelled = false;
+    void supabase.auth.getUser().then(({ data }) => {
+      if (cancelled || !data.user) return;
+      channel = supabase.channel(`missed-count-${data.user.id}`)
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "calls",
+          filter: `callee_id=eq.${data.user.id}` }, () => { void refreshMissedCount(); })
+        .subscribe();
+    });
+    return () => { cancelled = true; if (channel) void supabase.removeChannel(channel); };
+  }, [refreshMissedCount]);
+
   const params = useLocalSearchParams<{
     qallId?: string | string[];
     selectionKey?: string | string[];
@@ -183,6 +215,15 @@ export default function QallScreen() {
               size={23}
               color="#176B5B"
             />
+            {unreadMissedCount > 0 && (
+              <View style={{ position: "absolute", right: -5, top: -6,
+                backgroundColor: "#B42318", borderRadius: 12, minWidth: 19,
+                height: 19, paddingHorizontal: 4, alignItems: "center", justifyContent: "center" }}>
+                <Text style={{ color: "white", fontSize: 11, fontWeight: "800" }}>
+                  {unreadMissedCount > 99 ? "99+" : unreadMissedCount}
+                </Text>
+              </View>
+            )}
           </Pressable>
         </View>
 

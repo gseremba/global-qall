@@ -1,5 +1,13 @@
 ﻿import { IncomingGroupCallProvider } from "../components/IncomingGroupCallProvider";
-import { Stack } from "expo-router";
+//import { Stack } from "expo-router";
+//import { Stack, usePathname } from "expo-router";
+
+import {
+  usePathname,
+  useSegments,
+  Stack
+} from "expo-router";
+
 import { useEffect } from "react";
 import {
   ActivityIndicator,
@@ -53,6 +61,21 @@ function VoipPushRegistration() {
 
     setVoipPushUser(session?.user?.id ?? null);
   }, [session?.user?.id, loading]);
+
+  return null;
+}
+
+function RouteDebug() {
+  const pathname = usePathname();
+  const segments = useSegments();
+
+  useEffect(() => {
+    console.log("[ROUTE DEBUG]", {
+      pathname,
+      segments,
+      timestamp: new Date().toISOString(),
+    });
+  }, [pathname, segments]);
 
   return null;
 }
@@ -132,6 +155,9 @@ function RootNavigator() {
 export default function RootLayout() {
   return (
     <AuthProvider>
+	  
+	   <RouteDebug />
+	   
       <MessagePushRegistration />
 
       {Platform.OS === "ios" ? <VoipPushRegistration /> : null}

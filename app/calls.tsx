@@ -2,6 +2,7 @@ import Ionicons from "@expo/vector-icons/Ionicons";
 import {
   router,
   Stack,
+  useFocusEffect,
 } from "expo-router";
 import {
   ActivityIndicator,
@@ -212,6 +213,20 @@ export default function CallHistoryScreen() {
       setRefreshing(false);
     }
   }, [user]);
+
+  // Opening Call History acknowledges missed calls up to the current time.
+  // A call becoming missed later remains unread until the next visit.
+  useFocusEffect(useCallback(() => {
+    if (!user) return;
+    void (async () => {
+      const viewedAt = new Date().toISOString();
+      const { error } = await supabase.from("profiles")
+        .update({ call_history_last_viewed_at: viewedAt })
+        .eq("id", user.id);
+      if (error) console.warn("[CALL HISTORY] Could not mark viewed:", error.message);
+      await loadHistory();
+    })();
+  }, [user, loadHistory]));
 
   useEffect(() => {
     void loadHistory();

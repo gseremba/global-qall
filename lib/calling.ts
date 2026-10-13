@@ -28,6 +28,10 @@ export type VoiceCall = {
 };
 
 function friendlyCallError(message: string): Error {
+  if (message.includes("CALL_BLOCKED")) {
+    return new Error("This call cannot be placed because one of you has blocked the other.");
+  }
+
   if (message.includes("USER_BUSY")) {
     return new Error("User is busy.");
   }

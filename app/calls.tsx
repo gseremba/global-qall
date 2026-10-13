@@ -13,6 +13,7 @@ import {
   RefreshControl,
   SafeAreaView,
   StyleSheet,
+  TextInput,
   Text,
   View,
 } from "react-native";
@@ -20,6 +21,7 @@ import {
   useCallback,
   useEffect,
   useState,
+  useRef,
 } from "react";
 
 import { UserAvatar } from "../components/UserAvatar";
@@ -65,6 +67,22 @@ function formatDuration(item: HistoryItem): string | null {
   if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
+}
+
+type DateFilter = "all" | "today" | "7days" | "30days";
+
+function startOfLocalDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function historyDayLabel(value: string, now: Date): string {
+  const date = new Date(value);
+  const day = startOfLocalDay(date).getTime();
+  const today = startOfLocalDay(now).getTime();
+  if (day === today) return "Today";
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+  if (day === yesterday) return "Yesterday";
+  return date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" });
 }
 
 function statusLabel(item: HistoryItem): string {
@@ -122,107 +140,102 @@ export default function CallHistoryScreen() {
   const [filter, setFilter] =
     useState<"all" | "missed" | "incoming" | "outgoing">("all");
 
+  const [searchText, setSearchText] = useState("");
+  const [dateFilter, setDateFilter] = useState<DateFilter>("all");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [queryDay, setQueryDay] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(searchText.trim()), 350);
+    return () => clearTimeout(timer);
+  }, [searchText]);
+  useFocusEffect(useCallback(() => {
+    setQueryDay(new Date());
+  }, []));
+  const dateStart = dateFilter === "all" ? null :
+    dateFilter === "today" ? startOfLocalDay(queryDay).toISOString() :
+    new Date(queryDay.getFullYear(), queryDay.getMonth(),
+      queryDay.getDate() - (dateFilter === "7days" ? 6 : 29)).toISOString();
   const [selected, setSelected] = useState<HistoryItem | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Server-side filters determine the returned page, not the client list.
+  const pageRef = useRef(0);
+  const requestRef = useRef(0);
+  const loadingMoreRef = useRef(false);
+  const hasMoreRef = useRef(false);
+  const PAGE_SIZE = 30;
 
-  const loadHistory = useCallback(async () => {
-    if (!user) {
-      return;
+  const loadHistory = useCallback(async (append = false) => {
+    if (!user) return;
+    if (!append) {
+      // Invalidate an older page request before starting a new query.
+      hasMoreRef.current = false;
+      setHasMore(false);
+      setLoading(true);
     }
-
+    if (append) {
+      if (loadingMoreRef.current || !hasMoreRef.current) return;
+      loadingMoreRef.current = true;
+      setLoadingMore(true);
+    }
+    const requestId = ++requestRef.current;
+    const page = append ? pageRef.current : 0;
     try {
-      await expireStaleCalls();
-
-      const { data: calls, error } = await supabase
-        .from("calls")
-        .select("*")
-        .or(
-          `caller_id.eq.${user.id},callee_id.eq.${user.id}`
-        )
-        .order("created_at", {
-          ascending: false,
-        })
-        .limit(100);
-
-      if (error) {
-        throw error;
-      }
-
-      const { data: hidden, error: hiddenError } = await supabase
-        .from("call_history_hidden")
-        .select("call_id")
-        .eq("user_id", user.id);
-      if (hiddenError) throw hiddenError;
-      const hiddenIds = new Set((hidden ?? []).map((row) => row.call_id));
-      const callRows = ((calls ?? []) as VoiceCall[]).filter((call) => !hiddenIds.has(call.id));
-      const otherIds = Array.from(
-        new Set(
-          callRows.map((call) =>
-            call.caller_id === user.id
-              ? call.callee_id
-              : call.caller_id
-          )
-        )
-      );
-
-      const { data: profiles, error: profileError } =
-        otherIds.length > 0
-          ? await supabase
-              .from("profiles")
-              .select(
-                "id, display_name, qall_id, avatar_url"
-              )
-              .in("id", otherIds)
-          : { data: [], error: null };
-
-      if (profileError) {
-        throw profileError;
-      }
-
-      const profileMap = new Map(
-        (profiles ?? []).map((profile) => [
-          profile.id,
-          profile,
-        ])
-      );
-
-      setItems(
-        callRows.map((call) => {
-          const outgoing =
-            call.caller_id === user.id;
-          const otherId = outgoing
-            ? call.callee_id
-            : call.caller_id;
-          const profile = profileMap.get(otherId);
-
-          return {
-            ...call,
-            other_user_id: otherId,
-            other_name:
-              profile?.display_name ??
-              "Global Qall User",
-            other_qall_id:
-              profile?.qall_id ?? "",
-            other_avatar_url:
-              profile?.avatar_url ?? null,
-            direction: outgoing
-              ? "outgoing"
-              : "incoming",
-          };
-        })
-      );
+      if (!append) await expireStaleCalls();
+      const { data: calls, error } = await supabase.rpc("search_visible_call_history", {
+        p_limit: PAGE_SIZE,
+        p_offset: page * PAGE_SIZE,
+        p_search: debouncedSearch,
+        p_direction: filter,
+        p_since: dateStart,
+      });
+      if (error) throw error;
+      const callRows = (calls ?? []) as VoiceCall[];
+      const otherIds = Array.from(new Set(callRows.map(call =>
+        call.caller_id === user.id ? call.callee_id : call.caller_id
+      )));
+      const { data: profiles, error: profileError } = otherIds.length
+        ? await supabase.from("profiles")
+            .select("id, display_name, qall_id, avatar_url")
+            .in("id", otherIds)
+        : { data: [], error: null };
+      if (profileError) throw profileError;
+      const profileMap = new Map((profiles ?? []).map(profile => [profile.id, profile]));
+      const nextItems: HistoryItem[] = callRows.map(call => {
+        const outgoing = call.caller_id === user.id;
+        const otherId = outgoing ? call.callee_id : call.caller_id;
+        const profile = profileMap.get(otherId);
+        return {
+          ...call,
+          other_user_id: otherId,
+          other_name: profile?.display_name ?? "Global Qall User",
+          other_qall_id: profile?.qall_id ?? "",
+          other_avatar_url: profile?.avatar_url ?? null,
+          direction: outgoing ? "outgoing" : "incoming",
+        };
+      });
+      if (requestId !== requestRef.current) return;
+      pageRef.current = page + 1;
+      hasMoreRef.current = callRows.length === PAGE_SIZE;
+      setHasMore(hasMoreRef.current);
+      setItems(previous => append
+        ? Array.from(new Map([...previous, ...nextItems].map(item => [item.id, item])).values())
+        : nextItems);
     } catch (error) {
-      Alert.alert(
-        "Call history error",
-        error instanceof Error
-          ? error.message
-          : "Could not load call history."
-      );
+      if (requestId === requestRef.current) Alert.alert("Call history error",
+        error instanceof Error ? error.message : "Could not load call history.");
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestId === requestRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+      if (append) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
     }
-  }, [user]);
+  }, [user, debouncedSearch, filter, dateStart]);
 
   // Opening Call History acknowledges missed calls up to the current time.
   // A call becoming missed later remains unread until the next visit.
@@ -269,6 +282,12 @@ export default function CallHistoryScreen() {
           }
         }
       )
+      .on("postgres_changes", {
+        event: "*", schema: "public", table: "call_history_hidden", filter: `user_id=eq.${user.id}`,
+      }, () => { void loadHistory(); })
+      .on("postgres_changes", {
+        event: "*", schema: "public", table: "call_history_settings", filter: `user_id=eq.${user.id}`,
+      }, () => { void loadHistory(); })
       .subscribe();
 
     return () => {
@@ -276,17 +295,26 @@ export default function CallHistoryScreen() {
     };
   }, [loadHistory, user]);
 
-  const missedItems = items.filter(
-    (item) =>
-      item.status === "missed" &&
-      item.direction === "incoming"
-  );
+  const normalizedSearch = debouncedSearch.toLocaleLowerCase();
+  const nowForFilters = new Date();
+  const displayedItems = items;
 
-  const displayedItems = items.filter((item) =>
-    filter === "all" ||
-    (filter === "missed" && item.status === "missed" && item.direction === "incoming") ||
-    filter === item.direction
-  );
+  const emptyTitle = normalizedSearch
+    ? "No matching calls"
+    : dateFilter !== "all"
+      ? "No calls in this period"
+      : filter === "missed"
+        ? "No missed calls"
+        : filter === "incoming"
+          ? "No incoming calls"
+          : filter === "outgoing"
+            ? "No outgoing calls"
+            : "No calls yet";
+  const emptyDescription = normalizedSearch || dateFilter !== "all"
+    ? "Try another search or change your filters."
+    : filter === "missed"
+      ? "Missed incoming calls will appear here."
+      : "Your Global Qall call history will appear here.";
 
   async function hideCalls(callIds: string[]) {
     if (!user || busy || callIds.length === 0) return;
@@ -313,11 +341,26 @@ export default function CallHistoryScreen() {
     ]);
   }
 
+  async function clearEntireHistory() {
+    if (!user || busy) return;
+    setBusy(true);
+    try {
+      const { error } = await supabase.rpc("clear_my_call_history");
+      if (error) throw error;
+      setSelected(null);
+      await loadHistory();
+    } catch (error) {
+      Alert.alert("Call history error", error instanceof Error ? error.message : "Could not clear history.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function confirmClear() {
-    if (!items.length || busy) return;
-    Alert.alert("Clear call history?", "All displayed and filtered calls will be hidden from your history only. This cannot be undone.", [
+    if (busy) return;
+    Alert.alert("Clear call history?", "Your entire call history, including older calls, will be hidden from your account only. This cannot be undone.", [
       { text: "Cancel", style: "cancel" },
-      { text: "Clear history", style: "destructive", onPress: () => void hideCalls(items.map((item) => item.id)) },
+      { text: "Clear history", style: "destructive", onPress: () => void clearEntireHistory() },
     ]);
   }
 
@@ -369,8 +412,8 @@ export default function CallHistoryScreen() {
 
           <Text style={styles.heading}>Call History</Text>
 
-          <Pressable onPress={confirmClear} disabled={busy || items.length === 0} style={styles.headerSpacer} accessibilityLabel="Clear call history">
-            <Ionicons name="trash-outline" size={21} color={items.length ? "#B42318" : "#AAB2AF"} />
+          <Pressable onPress={confirmClear} disabled={busy} style={styles.headerSpacer} accessibilityLabel="Clear call history">
+            <Ionicons name="trash-outline" size={21} color="#B42318" />
           </Pressable>
         </View>
 
@@ -410,14 +453,49 @@ export default function CallHistoryScreen() {
               ]}
             >
               Missed
-              {missedItems.length > 0
-                ? ` (${missedItems.length})`
-                : ""}
+
             </Text>
           </Pressable>
           {(["incoming", "outgoing"] as const).map((value) => (
             <Pressable key={value} onPress={() => setFilter(value)} style={[styles.filterButton, filter === value && styles.filterButtonActive]}>
               <Text style={[styles.filterText, filter === value && styles.filterTextActive]}>{value === "incoming" ? "Incoming" : "Outgoing"}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <View style={styles.searchContainer}>
+          <Ionicons name="search-outline" size={19} color="#65706D" />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search name or Qall ID"
+            placeholderTextColor="#8A9591"
+            value={searchText}
+            onChangeText={setSearchText}
+            autoCapitalize="none"
+            autoCorrect={false}
+            accessibilityLabel="Search call history"
+          />
+          {searchText.length > 0 && (
+            <Pressable onPress={() => setSearchText("")} accessibilityLabel="Clear search">
+              <Ionicons name="close-circle" size={19} color="#65706D" />
+            </Pressable>
+          )}
+        </View>
+        <View style={styles.dateFilters}>
+          {([
+            ["all", "All Time"],
+            ["today", "Today"],
+            ["7days", "Last 7 Days"],
+            ["30days", "Last 30 Days"],
+          ] as const).map(([value, label]) => (
+            <Pressable
+              key={value}
+              onPress={() => setDateFilter(value)}
+              style={[styles.dateButton, dateFilter === value && styles.dateButtonActive]}
+            >
+              <Text style={[styles.dateButtonText, dateFilter === value && styles.dateButtonTextActive]}>
+                {label}
+              </Text>
             </Pressable>
           ))}
         </View>
@@ -432,6 +510,9 @@ export default function CallHistoryScreen() {
         ) : (
           <FlatList
             data={displayedItems}
+            onEndReached={() => { if (hasMore && !loadingMore) void loadHistory(true); }}
+            onEndReachedThreshold={0.4}
+            ListFooterComponent={loadingMore ? <ActivityIndicator color="#176B5B" style={{ padding: 16 }} /> : null}
             keyExtractor={(item) => item.id}
             refreshControl={
               <RefreshControl
@@ -455,24 +536,27 @@ export default function CallHistoryScreen() {
                   color="#176B5B"
                 />
                 <Text style={styles.emptyTitle}>
-                  {filter === "missed"
-                    ? "No missed calls"
-                    : "No calls yet"}
+                  {emptyTitle}
                 </Text>
                 <Text style={styles.emptyText}>
-                  {filter === "missed"
-                    ? "Missed incoming calls will appear here."
-                    : "Your Global Qall call history will appear here."}
+                  {emptyDescription}
                 </Text>
               </View>
             }
-            renderItem={({ item }) => {
+            renderItem={({ item, index }) => {
+              const dayLabel = historyDayLabel(item.created_at, nowForFilters);
+              const previousDayLabel = index > 0
+                ? historyDayLabel(displayedItems[index - 1].created_at, nowForFilters)
+                : null;
+              const showDayHeader = dayLabel !== previousDayLabel;
               const missed =
                 item.status === "missed" &&
                 item.direction === "incoming";
               const duration = formatDuration(item);
 
               return (
+                <View>
+                  {showDayHeader && <Text style={styles.dayHeader}>{dayLabel}</Text>}
                 <View style={styles.row}>
                   <Pressable onPress={() => setSelected(item)} style={styles.rowMain} accessibilityLabel={`View details for ${item.other_name}`}>
                   <UserAvatar
@@ -537,6 +621,7 @@ export default function CallHistoryScreen() {
                       color="#176B5B"
                     />
                   </Pressable>
+                </View>
                 </View>
               );
             }}
@@ -629,6 +714,56 @@ const styles = StyleSheet.create({
   },
   filterTextActive: {
     color: "#176B5B",
+  },
+  searchContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#DCE3E0",
+    borderRadius: 12,
+    marginHorizontal: 14,
+    marginTop: 12,
+    paddingHorizontal: 12,
+    minHeight: 44,
+  },
+  searchInput: {
+    flex: 1,
+    minHeight: 44,
+    color: "#18201E",
+    fontSize: 14,
+  },
+  dateFilters: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 7,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 4,
+  },
+  dateButton: {
+    paddingHorizontal: 11,
+    minHeight: 32,
+    justifyContent: "center",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#DCE3E0",
+    backgroundColor: "#FFFFFF",
+  },
+  dateButtonActive: {
+    backgroundColor: "#E6F2EF",
+    borderColor: "#176B5B",
+  },
+  dateButtonText: { fontSize: 12, fontWeight: "600", color: "#65706D" },
+  dateButtonTextActive: { color: "#176B5B" },
+  dayHeader: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#65706D",
+    marginTop: 8,
+    marginBottom: 9,
+    marginLeft: 3,
   },
   center: {
     flex: 1,

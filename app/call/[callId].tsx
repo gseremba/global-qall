@@ -4,6 +4,7 @@ import * as Network from "expo-network";
 import { setAudioModeAsync, useAudioPlayer
 } from "expo-audio";
 import InCallManager from "react-native-incall-manager";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -11,6 +12,8 @@ import {
   AppState,
   Animated,
   Modal,
+  FlatList,
+  TextInput,
   PanResponder,
   Pressable,
   SafeAreaView,
@@ -29,6 +32,7 @@ import {
 } from "react-native-webrtc";
 
 import { UserAvatar } from "../../components/UserAvatar";
+import { DirectConferenceMedia } from "../../components/DirectConferenceMedia";
 import { useAuth } from "../../contexts/AuthContext";
 import {
   expireStaleCalls,
@@ -252,6 +256,7 @@ type OtherProfile = {
 
 export default function CallScreen() {
   const { user } = useAuth();
+  const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{
     callId?: string | string[];
     direction?: string | string[];
@@ -268,6 +273,23 @@ export default function CallScreen() {
     ? params.returnCallId[0]
     : params.returnCallId;
 
+  // Sprint 14.3B: local-only contact selection; no conference signaling.
+  const [pickerVisible, setPickerVisible] = useState(false);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [pickerContacts, setPickerContacts] = useState<Array<{
+    id: string; name: string; qallId: string;
+  }>>([]);
+  const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
+  const [invitationSending, setInvitationSending] = useState(false);
+  const [conferenceInvitations, setConferenceInvitations] = useState<Array<{
+    id: string; invitee_id: string; status: string; expires_at: string;
+  }>>([]);
+  // Sprint 14.3D.2: database membership only. Never touches the direct WebRTC peer.
+  const [conferenceMembers, setConferenceMembers] = useState<Array<{
+    user_id: string; role: string; status: string;
+  }>>([]);
+  const conferenceSyncBusyRef = useRef(false);
   const [call, setCall] = useState<VoiceCall | null>(null);
   const [otherProfile, setOtherProfile] = useState<OtherProfile | null>(null);
   const [loading, setLoading] = useState(true);
@@ -564,6 +586,142 @@ export default function CallScreen() {
       },
     })
   ).current;
+
+  const openParticipantPicker = useCallback(async () => {
+    if (!user?.id || !call || call.status !== "accepted") return;
+    setPickerVisible(true);
+    setPickerLoading(true);
+    setPickerSearch("");
+    setSelectedContactIds([]);
+    try {
+      const otherId = call.caller_id === user.id ? call.callee_id : call.caller_id;
+      const { data: saved, error: savedError } = await supabase
+        .from("contacts")
+        .select("contact_user_id, contact_name")
+        .eq("owner_id", user.id)
+        .order("contact_name", { ascending: true });
+      if (savedError) throw savedError;
+      const rows = (saved ?? []).filter((c) =>
+        c.contact_user_id !== user.id && c.contact_user_id !== otherId
+      );
+      const ids = [...new Set(rows.map((c) => c.contact_user_id as string))];
+      if (!ids.length) { setPickerContacts([]); return; }
+      const { data: profiles, error: profileError } = await supabase
+        .from("profiles")
+        .select("id, display_name, qall_id")
+        .in("id", ids);
+      if (profileError) throw profileError;
+      const profileMap = new Map((profiles ?? []).map((p) => [p.id, p]));
+      setPickerContacts(rows.filter((c) => profileMap.has(c.contact_user_id)).map((c) => {
+        const p = profileMap.get(c.contact_user_id)!;
+        return {
+          id: c.contact_user_id as string,
+          name: (c.contact_name || p.display_name || "Global Qall User") as string,
+          qallId: (p.qall_id || "") as string,
+        };
+      }));
+    } catch (error) {
+      setPickerContacts([]);
+      Alert.alert("Contacts", error instanceof Error ? error.message : "Could not load contacts.");
+    } finally {
+      setPickerLoading(false);
+    }
+  }, [call, user?.id]);
+
+  // Sprint 14.3C.2: invitation signaling only; never changes active WebRTC media.
+  const refreshConferenceInvitations = useCallback(async () => {
+    if (!callId || !user?.id || callStatusRef.current !== "accepted") return;
+    const { data, error } = await supabase
+      .from("conference_invitations")
+      .select("id, invitee_id, status, expires_at")
+      .eq("call_id", callId)
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.warn("[CONFERENCE INVITES] Refresh failed:", error.message);
+      return;
+    }
+    setConferenceInvitations((data ?? []) as Array<{
+      id: string; invitee_id: string; status: string; expires_at: string;
+    }>);
+  }, [callId, user?.id]);
+
+  useEffect(() => {
+    if (!callId || !user?.id || call?.status !== "accepted") {
+      setConferenceInvitations([]);
+      return;
+    }
+    void refreshConferenceInvitations();
+    const interval = setInterval(() => {
+      if (AppState.currentState === "active") void refreshConferenceInvitations();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [callId, user?.id, call?.status, refreshConferenceInvitations]);
+
+  const synchronizeConferenceMembership = useCallback(async () => {
+    if (!callId || !user?.id || callStatusRef.current !== "accepted" || conferenceSyncBusyRef.current) return;
+    conferenceSyncBusyRef.current = true;
+    try {
+      // Only original call participants may initialize the conference via this RPC.
+      const { data: accepted, error: invitationError } = await supabase
+        .from("conference_invitations")
+        .select("id")
+        .eq("call_id", callId)
+        .eq("status", "accepted")
+        .limit(1);
+      if (invitationError) throw invitationError;
+      if (!accepted?.length) { setConferenceMembers([]); return; }
+      const { data: conferenceId, error: prepareError } = await supabase.rpc(
+        "prepare_direct_call_conference", { requested_call_id: callId }
+      );
+      if (prepareError) throw prepareError;
+      if (!conferenceId) return;
+      const { data: members, error: membersError } = await supabase
+        .from("direct_call_conference_participants")
+        .select("user_id, role, status")
+        .eq("conference_id", conferenceId);
+      if (membersError) throw membersError;
+      setConferenceMembers((members ?? []) as Array<{user_id: string; role: string; status: string}>);
+    } catch (error) {
+      console.warn("[CONFERENCE SYNC]", error instanceof Error ? error.message : String(error));
+    } finally {
+      conferenceSyncBusyRef.current = false;
+    }
+  }, [callId, user?.id]);
+
+  useEffect(() => {
+    if (!callId || !user?.id || call?.status !== "accepted") {
+      setConferenceMembers([]);
+      return;
+    }
+    void synchronizeConferenceMembership();
+    const interval = setInterval(() => {
+      if (AppState.currentState === "active") void synchronizeConferenceMembership();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [callId, user?.id, call?.status, synchronizeConferenceMembership]);
+
+  const sendConferenceInvitations = useCallback(async () => {
+    if (invitationSending || !callId || !user?.id || call?.status !== "accepted" || !selectedContactIds.length) return;
+    setInvitationSending(true);
+    try {
+      // The RPC validates call membership, block relationships, busy state and capacity.
+      const { data, error } = await supabase.rpc("invite_to_conference", {
+        requested_call_id: callId,
+        requested_invitee_ids: selectedContactIds,
+      });
+      if (error) throw error;
+      const count = Array.isArray(data) ? data.length : selectedContactIds.length;
+      setPickerVisible(false);
+      setSelectedContactIds([]);
+      await refreshConferenceInvitations();
+      Alert.alert("Invitations sent", `${count} invitation(s) created. Your current call remains connected.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to send invitations.";
+      Alert.alert("Invitation not sent", message);
+    } finally {
+      setInvitationSending(false);
+    }
+  }, [invitationSending, callId, user?.id, call?.status, selectedContactIds, refreshConferenceInvitations]);
 
   const isCaller = Boolean(call && user && call.caller_id === user.id);
   const isIncoming = Boolean(
@@ -5165,6 +5323,9 @@ export default function CallScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
+      {call?.status === "accepted" && conferenceMembers.some(member => member.role === "invitee" && member.status !== "left") && user?.id && localStream && (
+        <DirectConferenceMedia callId={callId!} userId={user.id} sharedStream={localStream} video={isVideoCall} onToggleMute={toggleMute} onToggleCamera={toggleCamera} onToggleSpeaker={toggleSpeaker} onAddParticipant={() => void openParticipantPicker()} mutedExternal={muted} cameraEnabledExternal={cameraEnabled} speakerOnExternal={speakerOn} onLeave={handleEndPress} />
+      )}
 
       <Modal
         visible={Boolean(waitingCall)}
@@ -5247,7 +5408,101 @@ export default function CallScreen() {
         </View>
       </Modal>
 
+      {/* Sprint 14.3C.2 — invitation RPC; direct call media remains untouched. */}
+      <Modal visible={pickerVisible} animationType="slide" transparent onRequestClose={() => { if (!invitationSending) setPickerVisible(false); }}>
+        <View style={styles.pickerBackdrop}>
+          <View style={styles.pickerPanel}>
+            <View style={styles.pickerHeader}>
+              <Text style={styles.pickerTitle}>Add participants</Text>
+              <Pressable onPress={() => { if (!invitationSending) setPickerVisible(false); }} accessibilityLabel="Close contact selection">
+                <Ionicons name="close" size={26} color="#FFFFFF" />
+              </Pressable>
+            </View>
+            <TextInput
+              value={pickerSearch}
+              onChangeText={setPickerSearch}
+              placeholder="Search contacts or Qall ID"
+              placeholderTextColor="#9BAFAA"
+              style={styles.pickerSearch}
+              autoCorrect={false}
+            />
+            {pickerLoading ? <ActivityIndicator color="#FFFFFF" style={{ margin: 24 }} /> : (
+              <FlatList
+                data={pickerContacts.filter((c) =>
+                  `${c.name} ${c.qallId}`.toLowerCase().includes(pickerSearch.trim().toLowerCase())
+                )}
+                keyExtractor={(item) => item.id}
+                keyboardShouldPersistTaps="handled"
+                ListEmptyComponent={<Text style={styles.pickerEmpty}>No eligible saved contacts found.</Text>}
+                renderItem={({ item }) => {
+                  const selected = selectedContactIds.includes(item.id);
+                  return (
+                    <Pressable
+                      style={styles.pickerRow}
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: selected }}
+                      onPress={() => setSelectedContactIds((current) =>
+                        selected ? current.filter((id) => id !== item.id) : [...current, item.id]
+                      )}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.pickerName}>{item.name}</Text>
+                        <Text style={styles.pickerId}>{item.qallId}</Text>
+                      </View>
+                      <Ionicons name={selected ? "checkbox" : "square-outline"} size={24} color="#FFFFFF" />
+                    </Pressable>
+                  );
+                }}
+              />
+            )}
+            {conferenceMembers.length > 0 && (
+              <Text style={{ color: "#A5D6C8", paddingHorizontal: 16, paddingTop: 8 }}>
+                Conference ready: {conferenceMembers.length} registered participant(s). Conference media connecting.
+              </Text>
+            )}
+            {conferenceInvitations.length > 0 && (
+              <View style={{ paddingHorizontal: 16, paddingVertical: 8 }}>
+                <Text style={{ color: "#FFFFFF", fontWeight: "600", marginBottom: 4 }}>Invitation status</Text>
+                {conferenceInvitations.slice(0, 6).map((invitation) => {
+                  const contact = pickerContacts.find((item) => item.id === invitation.invitee_id);
+                  const status = invitation.status === "pending" && new Date(invitation.expires_at).getTime() <= Date.now()
+                    ? "expired" : invitation.status;
+                  return (
+                    <Text key={invitation.id} style={{ color: "#C5D8D3", marginBottom: 3 }}>
+                      {contact?.name ?? "Contact"}: {status}
+                    </Text>
+                  );
+                })}
+              </View>
+            )}
+            <Pressable
+              style={[styles.pickerDone, (!selectedContactIds.length || invitationSending) && { opacity: 0.5 }]}
+              disabled={!selectedContactIds.length || invitationSending}
+              onPress={() => void sendConferenceInvitations()}
+            >
+              <Text style={styles.pickerDoneText}>{invitationSending ? "Sending…" : `Invite (${selectedContactIds.length})`}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       <SafeAreaView style={styles.safeArea}>
+        {!isVideoCall && call.status === "accepted" && (
+          <View style={[styles.participantHeader, { top: insets.top + 12 }]}>
+            <Text style={styles.participantHeaderName} numberOfLines={1}>
+              {otherName}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Add participant"
+              hitSlop={10}
+              onPress={() => void openParticipantPicker()}
+              style={styles.addParticipantButton}
+            >
+              <Ionicons name="person-add-outline" size={23} color="#FFFFFF" />
+            </Pressable>
+          </View>
+        )}
         {isVideoCall && !incomingWaiting ? (
           <View style={styles.videoStage}>
             {remoteVideoVisible ? (
@@ -5300,7 +5555,18 @@ export default function CallScreen() {
               </Animated.View>
             )}
 
-            <View style={styles.videoTopOverlay}>
+            {call.status === "accepted" && (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Add participant"
+                hitSlop={10}
+                onPress={() => void openParticipantPicker()}
+                style={[styles.videoAddParticipantButton, { top: insets.top + 18 }]}
+              >
+                <Ionicons name="person-add-outline" size={23} color="#FFFFFF" />
+              </Pressable>
+            )}
+            <View style={[styles.videoTopOverlay, { top: insets.top + 26 }]}>
               <Text style={styles.videoCallName}>
                 {otherName}
               </Text>
@@ -5310,11 +5576,22 @@ export default function CallScreen() {
                     ? `${otherName} is on hold`
                     : localOnHold
                       ? "Call on hold"
-                      : formatDuration(
-                          elapsedSeconds
-                        )
+                      : connectionLabel.startsWith("Reconnecting") ||
+                          connectionLabel === "Connection issue"
+                        ? connectionLabel
+                        : formatDuration(elapsedSeconds)
                   : connectionLabel}
               </Text>
+
+              {call.status === "accepted" &&
+                !localOnHold &&
+                !remoteOnHold &&
+                (connectionLabel.startsWith("Reconnecting") ||
+                  connectionLabel === "Connection issue") && (
+                  <Text style={styles.videoStatus}>
+                    {formatDuration(elapsedSeconds)}
+                  </Text>
+                )}
 
               {call.status === "accepted" &&
                 !localOnHold &&
@@ -5608,7 +5885,33 @@ export default function CallScreen() {
 }
 
 const styles = StyleSheet.create({
+  pickerBackdrop: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.65)" },
+  pickerPanel: { height: "76%", backgroundColor: "#102D28", borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 20, paddingBottom: 30 },
+  pickerHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 18 },
+  pickerTitle: { color: "#FFFFFF", fontSize: 20, fontWeight: "800" },
+  pickerSearch: { color: "#FFFFFF", backgroundColor: "#24463F", borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, marginBottom: 12 },
+  pickerRow: { minHeight: 66, flexDirection: "row", alignItems: "center", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#46615A", paddingVertical: 10 },
+  pickerName: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
+  pickerId: { color: "#BACAC6", fontSize: 12, marginTop: 4 },
+  pickerEmpty: { color: "#BACAC6", textAlign: "center", marginTop: 30 },
+  pickerDone: { backgroundColor: "#176B5B", padding: 15, alignItems: "center", borderRadius: 14, marginTop: 12 },
+  pickerDoneText: { color: "#FFFFFF", fontWeight: "800", fontSize: 16 },
+
   safeArea: { flex: 1, backgroundColor: "#102D28" },
+  participantHeader: {
+    position: "absolute", top: 12, left: 18, right: 18,
+    zIndex: 5, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12,
+  },
+  participantHeaderName: { color: "#FFFFFF", fontSize: 18, fontWeight: "800", flex: 1, textAlign: "left" },
+  addParticipantButton: {
+    width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.18)",
+  },
+  videoAddParticipantButton: {
+    position: "absolute", top: 18, right: 18, zIndex: 8,
+    width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.55)",
+  },
   center: {
     flex: 1,
     alignItems: "center",

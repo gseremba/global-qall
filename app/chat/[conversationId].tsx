@@ -58,6 +58,15 @@ import { startGroupCall, type GroupCallType } from "../../lib/groupCalling";
 import { supabase } from "../../lib/supabase";
 import { UserAvatar } from "../../components/UserAvatar";
 
+
+// Sprint 14.2B: translate database-enforced direct-message blocking errors.
+function directMessageError(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.includes("BLOCKED_DIRECT_MESSAGE")
+    ? "This direct conversation is blocked. Messages cannot be sent until the block is removed."
+    : null;
+}
+
 const PAGE_SIZE = 30;
 const MESSAGE_GROUP_WINDOW_MS = 5 * 60 * 1000;
 const TYPING_TIMEOUT_MS = 1400;
@@ -2035,6 +2044,13 @@ export default function ChatScreen() {
       );
       await markAsRead();
     } catch (error) {
+      const blockedMessage = directMessageError(error);
+      if (blockedMessage) {
+        setMessages((current) => current.filter((message) => message.id !== localId));
+        setMessageText((current) => current || body);
+        Alert.alert("Message blocked", blockedMessage);
+        return;
+      }
       setMessages((current) =>
         current.map((message) =>
           message.id === localId
@@ -2447,10 +2463,10 @@ export default function ChatScreen() {
       }, 60);
     } catch (error) {
       Alert.alert(
-        "Image upload error",
-        error instanceof Error
+        directMessageError(error) ? "Message blocked" : "Image upload error",
+        directMessageError(error) ?? (error instanceof Error
           ? error.message
-          : "Could not send the selected images."
+          : "Could not send the selected images.")
       );
     } finally {
       setUploadingImages(false);
@@ -2647,10 +2663,10 @@ export default function ChatScreen() {
       }, 60);
     } catch (error) {
       Alert.alert(
-        "Video upload error",
-        error instanceof Error
+        directMessageError(error) ? "Message blocked" : "Video upload error",
+        directMessageError(error) ?? (error instanceof Error
           ? error.message
-          : "Could not send the selected video."
+          : "Could not send the selected video.")
       );
     } finally {
       setUploadingVideo(false);
@@ -2878,10 +2894,10 @@ export default function ChatScreen() {
       }, 60);
     } catch (error) {
       Alert.alert(
-        "File upload error",
-        error instanceof Error
+        directMessageError(error) ? "Message blocked" : "File upload error",
+        directMessageError(error) ?? (error instanceof Error
           ? error.message
-          : "Could not send the selected file."
+          : "Could not send the selected file.")
       );
     } finally {
       setUploadingFile(false);
@@ -3116,10 +3132,10 @@ export default function ChatScreen() {
       }, 60);
     } catch (error) {
       Alert.alert(
-        "Voice message error",
-        error instanceof Error
+        directMessageError(error) ? "Message blocked" : "Voice message error",
+        directMessageError(error) ?? (error instanceof Error
           ? error.message
-          : "Could not send the voice message."
+          : "Could not send the voice message.")
       );
     } finally {
       setUploadingVoice(false);

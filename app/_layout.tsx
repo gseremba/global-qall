@@ -1,3 +1,4 @@
+import { IncomingConferenceInviteProvider } from "../components/IncomingConferenceInviteProvider";
 ﻿import { IncomingGroupCallProvider } from "../components/IncomingGroupCallProvider";
 //import { Stack } from "expo-router";
 //import { Stack, usePathname } from "expo-router";
@@ -162,11 +163,13 @@ export default function RootLayout() {
 
       {Platform.OS === "ios" ? <VoipPushRegistration /> : null}
 
-      <IncomingGroupCallProvider>
+      <IncomingConferenceInviteProvider>
+        <IncomingGroupCallProvider>
         <IncomingCallProvider>
           <RootNavigator />
         </IncomingCallProvider>
-      </IncomingGroupCallProvider>
+        </IncomingGroupCallProvider>
+      </IncomingConferenceInviteProvider>
     </AuthProvider>
   );
 }

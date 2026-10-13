@@ -23,6 +23,9 @@
         "UIBackgroundModes": [
           "audio",
           "voip",
+          "remote-notification",
+          "audio",
+          "voip",
           "remote-notification"
         ],
         "CFBundleDisplayName": "Global Qall"
@@ -53,7 +56,27 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.WAKE_LOCK",
-        "android.permission.BLUETOOTH"
+        "android.permission.BLUETOOTH",
+        "android.permission.BIND_TELECOM_CONNECTION_SERVICE",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.READ_PHONE_STATE",
+        "android.permission.CALL_PHONE",
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "BLUETOOTH",
+        "BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WAKE_LOCK",
+        "android.permission.BLUETOOTH",
+        "android.permission.BIND_TELECOM_CONNECTION_SERVICE",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.READ_PHONE_STATE",
+        "android.permission.CALL_PHONE"
       ],
       "package": "com.gseremba.globalqall",
       "googleServicesFile": "./google-services.json"
@@ -88,7 +111,8 @@
       ],
       "expo-asset",
       "./modules/global-qall-voip/app.plugin.js",
-      "./plugins/withAndroidFullScreenCall.js"
+      "./plugins/withAndroidFullScreenCall.js",
+      "./plugins/withFirebaseDisableSPM.js"
     ],
     "experiments": {
       "typedRoutes": true,
@@ -99,6 +123,12 @@
       "eas": {
         "projectId": "46c4b259-7198-4b51-b4e9-660f935beaf2"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/46c4b259-7198-4b51-b4e9-660f935beaf2"
     }
   }
 }

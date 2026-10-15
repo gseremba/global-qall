@@ -58,6 +58,8 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
   const ownedRef = useRef(false);
   const stoppedRef = useRef(false);
   const busyRef = useRef(false);
+  // Per-mesh-session recovery; the original A-B connection is never touched.
+  const recoveryRef = useRef(new Map<string, { generation: number; failedSince: number | null; lastRequestAt: number; attempts: number }>());
   const [remotes, setRemotes] = useState<Array<{ id: string; stream: MediaStream }>>([]);
   const [state, setState] = useState("Waiting for conference peers…");
   const [ownStream, setOwnStream] = useState<MediaStream | null>(null);
@@ -75,6 +77,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
     stoppedRef.current = true;
     for (const runtime of peers.current.values()) { try { runtime.pc.close(); } catch {} }
     peers.current.clear();
+    recoveryRef.current.clear();
     if (ownedRef.current) streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     ownedRef.current = false;
@@ -140,12 +143,15 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
         }
         const activeIds = new Set(sessions.map(s => s.id));
         for (const [id, runtime] of peers.current) {
-          if (!activeIds.has(id)) { runtime.pc.close(); peers.current.delete(id); updateRemotes(); }
+          if (!activeIds.has(id)) { runtime.pc.close(); peers.current.delete(id); recoveryRef.current.delete(id); updateRemotes(); }
         }
         for (const row of sessions) {
           if (cancelled || stoppedRef.current) return;
           let runtime = peers.current.get(row.id);
-          if (runtime && runtime.generation !== row.generation) { runtime.pc.close(); peers.current.delete(row.id); runtime = undefined; }
+          if (runtime && runtime.generation !== row.generation) { runtime.pc.close(); peers.current.delete(row.id); runtime = undefined; updateRemotes(); }
+          const prior = recoveryRef.current.get(row.id);
+          if (!prior) recoveryRef.current.set(row.id, { generation: row.generation, failedSince: null, lastRequestAt: 0, attempts: 0 });
+          else if (prior.generation !== row.generation) { prior.generation = row.generation; prior.failedSince = null; }
           if (!runtime) {
             const pc = new RTCPeerConnection({ iceServers: await iceServers(), iceTransportPolicy: "all" } as any);
             runtime = { pc, generation: row.generation, remote: null, seen: new Set(), pending: [], offered: false, answering: false, answered: false };
@@ -168,9 +174,41 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
               }
               updateRemotes();
             };
-            pc.onconnectionstatechange = () => { if (!stoppedRef.current) setState(`Conference peer: ${pc.connectionState}`); };
+            pc.onconnectionstatechange = () => {
+              if (stoppedRef.current || peers.current.get(sessionId)?.pc !== pc) return;
+              const recovery = recoveryRef.current.get(sessionId);
+              if (recovery) {
+                if (pc.connectionState === "connected") { recovery.failedSince = null; recovery.attempts = 0; }
+                else if (pc.connectionState === "failed" && recovery.failedSince === null) {
+                  recovery.failedSince = Date.now();
+                  console.warn("[CONF RECOVERY] Peer failed", sessionId, generation);
+                }
+              }
+              setState(`Conference peer: ${pc.connectionState}`);
+            };
           }
           const pc = runtime.pc;
+          const recovery = recoveryRef.current.get(row.id);
+          if (recovery && pc.connectionState === "failed") {
+            if (recovery.failedSince === null) recovery.failedSince = Date.now();
+            const now = Date.now();
+            if (now - recovery.failedSince >= 6000 && now - recovery.lastRequestAt >= 12000
+                && recovery.attempts < 2 && !cancelled && !stoppedRef.current) {
+              recovery.lastRequestAt = now;
+              recovery.attempts += 1;
+              console.log("[CONF RECOVERY] Requesting restart", row.id, row.generation);
+              const { data: nextGeneration, error: restartError } = await supabase.rpc(
+                "restart_direct_conference_peer",
+                { requested_peer_session_id: row.id, expected_generation: row.generation }
+              );
+              if (restartError) console.warn("[CONF RECOVERY] Restart error", restartError.message);
+              else if (typeof nextGeneration === "number" && nextGeneration > row.generation) {
+                console.log("[CONF RECOVERY] Generation advanced", row.id, nextGeneration);
+                setState("Reconnecting conference audio…");
+                continue;
+              } else console.log("[CONF RECOVERY] Server cooldown", row.id);
+            }
+          }
           // The database assigns a deterministic offerer. No glare or A-B renegotiation.
           if (row.offerer_id === userId && !row.offer && !runtime.offered && pc.signalingState === "stable") {
             runtime.offered = true;

@@ -97,36 +97,101 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
   }, [user?.id, refresh]);
 
   // Recipient observes authoritative membership; initialization belongs to A/B.
+  // Dismiss the invitee overlay when the original call/conference ends or C is removed.
   useEffect(() => {
     if (!user?.id) { setMembershipReady(false); acceptedCallIdRef.current = null; return; }
     let cancelled = false;
+    let lastObservedStatus: string | null = null;
+    let lastHeartbeatAt = 0;
+    console.log("[CONFERENCE C] Membership monitor mounted", { userId: user.id });
+    const terminalCallStatuses = new Set([
+      "ended", "completed", "rejected", "declined", "missed", "cancelled", "canceled", "failed", "busy", "no_answer",
+    ]);
+    const dismiss = (callId: string, reason: string) => {
+      if (cancelled || acceptedCallIdRef.current !== callId) return;
+      console.log("[CONFERENCE C] Closing conference screen", { callId, reason });
+      console.log("[CONFERENCE SYNC] Closing invitee screen:", reason);
+      acceptedCallIdRef.current = null;
+      setMembershipReady(false);
+    };
     const checkMembership = async () => {
       const acceptedCallId = acceptedCallIdRef.current;
-      if (!acceptedCallId || membershipBusyRef.current || AppState.currentState !== "active") return;
+      if (!acceptedCallId) return;
+      if (membershipBusyRef.current || AppState.currentState !== "active") {
+        if (Date.now() - lastHeartbeatAt > 5000) {
+          lastHeartbeatAt = Date.now();
+          console.log("[CONFERENCE C] Poll skipped", {
+            callId: acceptedCallId,
+            busy: membershipBusyRef.current,
+            appState: AppState.currentState,
+          });
+        }
+        return;
+      }
       membershipBusyRef.current = true;
+      if (Date.now() - lastHeartbeatAt > 5000) {
+        lastHeartbeatAt = Date.now();
+        console.log("[CONFERENCE C] Polling call:", acceptedCallId);
+      }
       try {
+        // Do not assume 'accepted' is the only valid active-call status.
+        const { data: call, error: callError } = await supabase
+          .from("calls")
+          .select("status")
+          .eq("id", acceptedCallId)
+          .maybeSingle();
+        if (callError) throw callError;
+        if (cancelled || acceptedCallIdRef.current !== acceptedCallId) return;
+        const observedStatus = call?.status == null ? "NOT_VISIBLE" : String(call.status);
+        if (observedStatus !== lastObservedStatus) {
+          lastObservedStatus = observedStatus;
+          console.log("[CONFERENCE C] Original call status:", observedStatus, "callId:", acceptedCallId);
+        }
+        if (call && terminalCallStatuses.has(String(call.status).toLowerCase())) {
+          dismiss(acceptedCallId, `original call ${call.status}`);
+          return;
+        }
+
         const { data: conference, error: conferenceError } = await supabase
           .from("direct_call_conferences")
-          .select("id")
+          .select("id,status")
           .eq("call_id", acceptedCallId)
           .maybeSingle();
         if (conferenceError) throw conferenceError;
+        if (cancelled || acceptedCallIdRef.current !== acceptedCallId) return;
+        // Conference may not exist immediately after accepting; wait for A/B initialization.
         if (!conference) return;
+        if (conference.status === "ended") {
+          dismiss(acceptedCallId, "conference ended");
+          return;
+        }
+
         const { data: member, error: memberError } = await supabase
           .from("direct_call_conference_participants")
-          .select("id")
+          .select("id,status")
           .eq("conference_id", conference.id)
           .eq("user_id", user.id)
-          .neq("status", "left")
           .maybeSingle();
         if (memberError) throw memberError;
-        if (!cancelled && member) setMembershipReady(true);
+        if (cancelled || acceptedCallIdRef.current !== acceptedCallId) return;
+        if (member?.status === "left" || member?.status === "removed") {
+          dismiss(acceptedCallId, `membership ${member.status}`);
+          return;
+        }
+        if (member) setMembershipReady(true);
+        // Before the first ready membership, a missing row may simply mean initialization
+        // has not completed. Never dismiss on a transient missing row.
       } catch (error) {
+        console.warn("[CONFERENCE C] Poll error:", { callId: acceptedCallId, message: error instanceof Error ? error.message : String(error) });
         console.warn("[CONFERENCE SYNC] Recipient:", error instanceof Error ? error.message : String(error));
       } finally { membershipBusyRef.current = false; }
     };
-    const interval = setInterval(() => { void checkMembership(); }, 3000);
-    return () => { cancelled = true; clearInterval(interval); };
+    void checkMembership();
+    const interval = setInterval(() => { void checkMembership(); }, 1500);
+    const subscription = AppState.addEventListener("change", state => {
+      if (state === "active") void checkMembership();
+    });
+    return () => { cancelled = true; clearInterval(interval); subscription.remove(); };
   }, [user?.id]);
 
   const respond = async (accept: boolean) => {
@@ -150,6 +215,7 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
       setIncoming(null);
       if (accept) {
         acceptedCallIdRef.current = incoming.invitation.call_id;
+        console.log("[CONFERENCE C] Invitation accepted for call:", incoming.invitation.call_id);
         setConferenceVideo(incoming.callType === "video");
         setMembershipReady(false);
         Alert.alert("Invitation accepted", "Waiting for the conference media connection.");

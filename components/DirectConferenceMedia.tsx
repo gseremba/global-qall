@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AppState, Image, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { Alert, AppState, Image, Modal, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import InCallManager from "react-native-incall-manager";
 import { setAudioModeAsync } from "expo-audio";
@@ -29,6 +29,9 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
   const { width, height } = useWindowDimensions();
   const landscape = width > height;
   const [speakerLocal, setSpeakerLocal] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [originalIds, setOriginalIds] = useState<string[]>([]);
   const [participantIds, setParticipantIds] = useState<string[]>([]);
   const [rosterReady, setRosterReady] = useState(false);
   const [profiles, setProfiles] = useState<Record<string, { name: string; avatar: string | null }>>({});
@@ -107,8 +110,10 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
         const { data: originalCall, error: callError } = await supabase.from("calls")
           .select("caller_id,callee_id").eq("id", callId).maybeSingle();
         if (callError) throw callError;
+		
         const originalOrder = [originalCall?.caller_id, originalCall?.callee_id]
           .filter((id): id is string => Boolean(id) && activeParticipantIds.includes(id as string));
+        setOriginalIds(previous => previous.join("|") === originalOrder.join("|") ? previous : originalOrder);
         const ordered = [...new Set([...originalOrder, ...activeParticipantIds.sort()])].slice(0, 8);
         setParticipantIds(previous => previous.join("|") === ordered.join("|") ? previous : ordered);
         setRosterReady(true);
@@ -270,6 +275,30 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
     })();
   };
 
+  // Server RPC enforces original-caller authorization; UI visibility is not security.
+  const removeParticipant = async (targetId: string) => {
+    if (invitee || !originalIds.includes(userId) || originalIds.includes(targetId) || removingId) return;
+    setRemovingId(targetId);
+    try {
+      const { error } = await supabase.rpc("remove_direct_conference_participant", {
+        requested_call_id: callId,
+        requested_user_id: targetId,
+      });
+      if (error) throw error;
+      setParticipantIds(previous => previous.filter(id => id !== targetId));
+      setManageOpen(false);
+    } catch (error) {
+      console.warn("[CONF REMOVE]", error);
+      Alert.alert("Could not remove participant", error instanceof Error ? error.message : "Please try again.");
+    } finally { setRemovingId(null); }
+  };
+  const confirmRemove = (targetId: string) => {
+    const name = profiles[targetId]?.name || "this participant";
+    Alert.alert("Remove participant", `Remove ${name} from this conference?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Remove", style: "destructive", onPress: () => { void removeParticipant(targetId); } },
+    ]);
+  };
   const toggleMuteLocal = () => {
     if (onToggleMute) { onToggleMute(); return; }
     const next = !muted;
@@ -324,6 +353,33 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
       })}
     </View>
     )}
+    {!video && !invitee && originalIds.includes(userId) && <Pressable accessibilityRole="button" accessibilityLabel="Manage conference participants" onPress={() => setManageOpen(true)} style={styles.manageButton}>
+      <Ionicons name="people-outline" size={18} color="#FFFFFF" />
+      <Text style={styles.manageText}>Manage participants</Text>
+    </Pressable>}
+    <Modal visible={manageOpen && !video} transparent animationType="fade" onRequestClose={() => setManageOpen(false)}>
+      <View style={styles.manageBackdrop}>
+        <View style={styles.managePanel}>
+          <Text style={styles.manageHeading}>Conference participants</Text>
+          <ScrollView style={styles.manageList}>
+            {participantIds.map(id => {
+              const isOriginal = originalIds.includes(id);
+              const canRemove = !isOriginal && id !== userId && !invitee;
+              return <View key={id} style={styles.manageRow}>
+                <Text style={styles.manageName} numberOfLines={1}>{id === userId ? "You" : (profiles[id]?.name || "Participant")}</Text>
+                <Text style={styles.manageRole}>{isOriginal ? "Original" : "Invited"}</Text>
+                {canRemove && <Pressable accessibilityRole="button" accessibilityLabel={`Remove ${profiles[id]?.name || "participant"}`} disabled={Boolean(removingId)} onPress={() => confirmRemove(id)} style={styles.removeButton}>
+                  <Text style={styles.removeText}>{removingId === id ? "Removing…" : "Remove"}</Text>
+                </Pressable>}
+              </View>;
+            })}
+          </ScrollView>
+          <Pressable accessibilityRole="button" accessibilityLabel="Close participant management" onPress={() => setManageOpen(false)} style={styles.manageClose}>
+            <Text style={styles.manageCloseText}>Close</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
     <View style={styles.actions}>
       <Pressable accessibilityRole="button" accessibilityLabel={mutedNow ? "Unmute" : "Mute"} onPress={toggleMuteLocal} style={styles.control}>
         <View style={[styles.controlCircle, mutedNow && styles.controlActive]}><Ionicons name={mutedNow ? "mic-off" : "mic"} size={24} color="white" /></View>
@@ -350,6 +406,19 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
 }
 
 const styles = StyleSheet.create({
+  manageButton: { flexDirection: "row", alignSelf: "center", alignItems: "center", gap: 7, paddingVertical: 9, paddingHorizontal: 16, borderRadius: 20, backgroundColor: "#334155" },
+  manageText: { color: "#FFFFFF", fontSize: 12, fontWeight: "700" },
+  manageBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.72)", justifyContent: "center", padding: 22 },
+  managePanel: { backgroundColor: "#1E293B", borderRadius: 18, padding: 18, maxHeight: "75%" },
+  manageHeading: { color: "white", fontSize: 18, fontWeight: "800", marginBottom: 14 },
+  manageList: { flexGrow: 0 },
+  manageRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#475569" },
+  manageName: { color: "white", flex: 1, fontSize: 13, fontWeight: "600" },
+  manageRole: { color: "#CBD5E1", fontSize: 11 },
+  removeButton: { backgroundColor: "#B91C1C", borderRadius: 9, paddingHorizontal: 12, paddingVertical: 9 },
+  removeText: { color: "white", fontSize: 12, fontWeight: "700" },
+  manageClose: { alignSelf: "flex-end", padding: 12, marginTop: 10 },
+  manageCloseText: { color: "#FFFFFF", fontWeight: "700" },
   fullScreen: { ...StyleSheet.absoluteFillObject, zIndex: 200, elevation: 20, backgroundColor: "#101820", paddingTop: 58, paddingHorizontal: 14, paddingBottom: 22 },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 12 },
   heading: { color: "white", fontSize: 18, fontWeight: "800", flexShrink: 1 },

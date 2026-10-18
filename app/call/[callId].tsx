@@ -728,6 +728,11 @@ export default function CallScreen() {
     call && user && call.callee_id === user.id
   );
   const isVideoCall = call?.call_type === "video";
+  // Hide the original direct-call video surface while the conference overlay is active.
+  // This does NOT stop local tracks or close the original A-B WebRTC peer.
+  const conferenceVideoActive = isVideoCall && conferenceMembers.some(
+    member => member.role === "invitee" && member.status !== "left"
+  );
   const localOnHold = Boolean(
     call && isCaller ? call.caller_on_hold : call?.callee_on_hold
   );
@@ -5324,7 +5329,7 @@ export default function CallScreen() {
     <>
       <Stack.Screen options={{ headerShown: false }} />
       {call?.status === "accepted" && conferenceMembers.some(member => member.role === "invitee" && member.status !== "left") && user?.id && localStream && (
-        <DirectConferenceMedia callId={callId!} userId={user.id} sharedStream={localStream} video={isVideoCall} onToggleMute={toggleMute} onToggleCamera={toggleCamera} onToggleSpeaker={toggleSpeaker} onAddParticipant={() => void openParticipantPicker()} mutedExternal={muted} cameraEnabledExternal={cameraEnabled} speakerOnExternal={speakerOn} onLeave={handleEndPress} />
+        <DirectConferenceMedia callId={callId!} userId={user.id} sharedStream={localStream} originalRemoteStream={!remoteOnHold ? remoteStream : null} originalRemoteUserId={call.caller_id === user.id ? call.callee_id : call.caller_id} video={isVideoCall} onToggleMute={toggleMute} onToggleCamera={toggleCamera} onToggleSpeaker={toggleSpeaker} onAddParticipant={() => void openParticipantPicker()} mutedExternal={muted} cameraEnabledExternal={cameraEnabled} speakerOnExternal={speakerOn} onLeave={handleEndPress} />
       )}
 
       <Modal
@@ -5503,7 +5508,7 @@ export default function CallScreen() {
             </Pressable>
           </View>
         )}
-        {isVideoCall && !incomingWaiting ? (
+        {isVideoCall && !incomingWaiting && !conferenceVideoActive ? (
           <View style={styles.videoStage}>
             {remoteVideoVisible ? (
               <RTCView

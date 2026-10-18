@@ -54,23 +54,36 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
       );
       if (!candidate) { setIncoming(null); return; }
 
-      // Fetch only display information. The RPC remains the authority for accepting.
-      const [profileResult, callResult] = await Promise.all([
+      // Fetch invitation display information without querying the calls table.
+      // The SECURITY DEFINER RPC verifies that this user is the invitee.
+      const [profileResult, callTypeResult] = await Promise.all([
         supabase.from("profiles").select("display_name, qall_id").eq("id", candidate.inviter_id).maybeSingle(),
-        supabase.from("calls").select("call_type, status").eq("id", candidate.call_id).maybeSingle(),
+        supabase.rpc("get_conference_invite_call_type", {
+          requested_invitation_id: candidate.id,
+        }),
       ]);
+
       if (generation !== generationRef.current) return;
-      // Never present an invitation for a call known to have ended.
-      if (callResult.data && callResult.data.status !== "accepted") {
-        setIncoming(null);
-        return;
+      if (callTypeResult.error) {
+        console.warn("[CONFERENCE C CALL TYPE] Lookup failed:", callTypeResult.error.message);
       }
+      const detectedType: InvitationDisplay["callType"] =
+        callTypeResult.data === "video" ? "video" :
+        callTypeResult.data === "audio" ? "audio" : "unknown";
+
+      console.log("[CONFERENCE C CALL TYPE]", {
+        callId: candidate.call_id,
+        invitationId: candidate.id,
+        rpcType: callTypeResult.data,
+        rpcError: callTypeResult.error?.message ?? null,
+        detectedType,
+      });
+
       const profile = profileResult.data;
       setIncoming({
         invitation: candidate,
         inviterName: profile?.display_name?.trim() || profile?.qall_id || "Global Qall user",
-        callType: callResult.data?.call_type === "video" ? "video" :
-          callResult.data?.call_type === "audio" ? "audio" : "unknown",
+        callType: detectedType,
       });
     } catch (error) {
       console.warn("[CONFERENCE INVITE] Refresh failed:", error instanceof Error ? error.message : String(error));

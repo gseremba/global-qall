@@ -23,8 +23,8 @@ async function iceServers(): Promise<any[]> {
 }
 
 /** Independent conference mesh. Never accesses the existing A-B peer or direct signaling tables. */
-export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = false, video = false, onLeave, onToggleMute, onToggleCamera, onToggleSpeaker, onAddParticipant, mutedExternal, cameraEnabledExternal, speakerOnExternal }: {
-  callId: string; userId: string; sharedStream?: MediaStream | null; invitee?: boolean; video?: boolean; onLeave?: () => void; onToggleMute?: () => void; onToggleCamera?: () => void; onToggleSpeaker?: () => void; onAddParticipant?: () => void; mutedExternal?: boolean; cameraEnabledExternal?: boolean; speakerOnExternal?: boolean;
+export function DirectConferenceMedia({ callId, userId, sharedStream, originalRemoteStream, originalRemoteUserId, invitee = false, video = false, onLeave, onToggleMute, onToggleCamera, onToggleSpeaker, onAddParticipant, mutedExternal, cameraEnabledExternal, speakerOnExternal }: {
+  callId: string; userId: string; sharedStream?: MediaStream | null; originalRemoteStream?: MediaStream | null; originalRemoteUserId?: string | null; invitee?: boolean; video?: boolean; onLeave?: () => void; onToggleMute?: () => void; onToggleCamera?: () => void; onToggleSpeaker?: () => void; onAddParticipant?: () => void; mutedExternal?: boolean; cameraEnabledExternal?: boolean; speakerOnExternal?: boolean;
 }) {
   const { width, height } = useWindowDimensions();
   const landscape = width > height;
@@ -117,7 +117,8 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
         const originalOrder = [originalCall?.caller_id, originalCall?.callee_id]
           .filter((id): id is string => Boolean(id) && activeParticipantIds.includes(id as string));
         setOriginalIds(previous => previous.join("|") === originalOrder.join("|") ? previous : originalOrder);
-        const ordered = [...new Set([...originalOrder, ...activeParticipantIds.sort()])].slice(0, 8);
+        // Stable across A/B/C even when invitee C cannot SELECT the original calls row (RLS).
+        const ordered = [...activeParticipantIds].sort().slice(0, 8);
         setParticipantIds(previous => previous.join("|") === ordered.join("|") ? previous : ordered);
         setRosterReady(true);
         const { data: rows, error: rowsError } = await supabase.rpc("ensure_direct_conference_peers", { requested_call_id: callId });
@@ -172,6 +173,14 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
                 if (!current.remote) current.remote = new MediaStream();
                 if (event.track && !current.remote.getTracks().some(t => t.id === event.track.id)) current.remote.addTrack(event.track);
               }
+              console.log("[CONF VIDEO TRACK]", {
+                sessionId,
+                peerA: sessionPeersRef.current.get(sessionId)?.peer_a_id,
+                peerB: sessionPeersRef.current.get(sessionId)?.peer_b_id,
+                trackKind: event.track?.kind ?? null,
+                videoTracks: current.remote?.getVideoTracks().length ?? 0,
+                streamId: current.remote?.id ?? null,
+              });
               updateRemotes();
             };
             pc.onconnectionstatechange = () => {
@@ -269,14 +278,54 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
   for (const [sessionId, runtime] of peers.current) {
     const session = sessionPeersRef.current.get(sessionId);
     if (!session || !runtime.remote) continue;
+    // Never attribute a stream to a user outside this peer session.
+    if (session.peer_a_id !== userId && session.peer_b_id !== userId) continue;
     const otherId = session.peer_a_id === userId ? session.peer_b_id : session.peer_a_id;
+    if (otherId === userId || !participantIds.includes(otherId)) continue;
+    if (remoteById.has(otherId)) {
+      console.warn("[CONF VIDEO] Duplicate peer mapping", { otherId, sessionId });
+      continue;
+    }
     remoteById.set(otherId, runtime.remote);
   }
   const orderedIds = rosterReady ? participantIds : [userId];
-  const tiles = orderedIds.map((id, index) => ({
-    id, index, isSelf: id === userId,
-    stream: id === userId ? local : remoteById.get(id) || null,
-  }));
+  // Original A/B may have an active direct-call video stream even when their
+  // independent conference mesh has not delivered a video track. Reuse that
+  // stream for DISPLAY only; keep conference audio and signaling unchanged.
+  // The explicit remote user ID prevents showing B's video in C's tile.
+  const tiles = orderedIds.map((id, index) => {
+    const isSelf = id === userId;
+    const conferenceStream = isSelf ? null : remoteById.get(id) || null;
+    const useOriginalVideo = Boolean(
+      video && !invitee && !isSelf && originalRemoteUserId === id &&
+      originalRemoteStream?.getVideoTracks().some(track => track.readyState === "live") &&
+      !conferenceStream?.getVideoTracks().some(track => track.readyState === "live")
+    );
+    return {
+      id, index, isSelf,
+      stream: isSelf ? local : (useOriginalVideo ? originalRemoteStream! : conferenceStream),
+      videoSource: useOriginalVideo ? "original-direct" : "conference-mesh",
+    };
+  });
+  // Diagnose mapping without altering the established mesh/signaling logic.
+  const videoDiagnosticSignature = tiles.map(tile =>
+    `${tile.id}:${tile.stream?.id ?? "none"}:${tile.stream?.getVideoTracks().length ?? 0}`
+  ).join("|");
+  const lastVideoDiagnosticRef = useRef("");
+  useEffect(() => {
+    if (!video || videoDiagnosticSignature === lastVideoDiagnosticRef.current) return;
+    lastVideoDiagnosticRef.current = videoDiagnosticSignature;
+    console.log("[CONF VIDEO TILES]", {
+      userId,
+      tiles: tiles.map(tile => ({
+        userId: tile.id,
+        self: tile.isSelf,
+        streamId: tile.stream?.id ?? null,
+        videoTracks: tile.stream?.getVideoTracks().length ?? 0,
+        videoSource: tile.videoSource,
+      })),
+    });
+  }, [video, videoDiagnosticSignature, userId]);
   // Invitees leave only their conference membership. A/B retain the existing
   // direct-call end behavior, which must not be changed by this sprint.
   const leaveConference = () => {
@@ -383,7 +432,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, invitee = 
     <View style={[styles.stage, landscape && styles.stageLandscape]}>
       {tiles.map((tile, index) => {
         const activeVideo = Boolean(video && tile.stream && (!tile.isSelf || cameraNow) && tile.stream.getVideoTracks().length);
-        return <View key={tile.id} style={[styles.tile, index === 0 && !landscape && styles.featuredTile, landscape && styles.landscapeTile]}>
+        return <View key={tile.id} style={[styles.tile, landscape && styles.landscapeTile]}>
           {activeVideo ? <RTCView streamURL={tile.stream!.toURL()} style={styles.video} objectFit="cover" mirror={tile.isSelf} /> :
             <View style={styles.placeholder}><Ionicons name={video ? "person" : "mic"} size={42} color="#E2E8F0" /></View>}
           <View style={styles.nameTag}><Text style={styles.tileText}>{tile.isSelf ? "You" : `Participant ${index + 1}`}</Text></View>
@@ -464,7 +513,7 @@ const styles = StyleSheet.create({
   status: { color: "#94A3B8", fontSize: 11, textAlign: "center", marginBottom: 12 },
   stage: { flex: 1, flexDirection: "row", flexWrap: "wrap", alignContent: "center", justifyContent: "center", gap: 8, minHeight: 0 },
   stageLandscape: { flexWrap: "nowrap", alignItems: "center" },
-  tile: { width: "48%", height: "33%", minHeight: 110, borderRadius: 12, overflow: "hidden", backgroundColor: "#334155" },
+  tile: { width: "48%", height: "47%", minHeight: 110, borderRadius: 12, overflow: "hidden", backgroundColor: "#334155" },
   featuredTile: { width: "100%", height: "52%" },
   landscapeTile: { flex: 1, width: undefined, height: "92%" },
   video: { width: "100%", height: "100%" },

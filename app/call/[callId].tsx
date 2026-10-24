@@ -731,7 +731,7 @@ export default function CallScreen() {
   // Hide the original direct-call video surface while the conference overlay is active.
   // This does NOT stop local tracks or close the original A-B WebRTC peer.
   const conferenceVideoActive = isVideoCall && conferenceMembers.some(
-    member => member.role === "invitee" && member.status !== "left"
+    member => member.role === "invitee" && !["left", "declined", "removed"].includes(member.status)
   );
   const localOnHold = Boolean(
     call && isCaller ? call.caller_on_hold : call?.callee_on_hold
@@ -5328,7 +5328,7 @@ export default function CallScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
-      {call?.status === "accepted" && conferenceMembers.some(member => member.role === "invitee" && member.status !== "left") && user?.id && localStream && (
+      {call?.status === "accepted" && conferenceMembers.some(member => member.role === "invitee" && !["left", "declined", "removed"].includes(member.status)) && user?.id && localStream && (
         <DirectConferenceMedia callId={callId!} userId={user.id} sharedStream={localStream} originalRemoteStream={!remoteOnHold ? remoteStream : null} originalRemoteUserId={call.caller_id === user.id ? call.callee_id : call.caller_id} video={isVideoCall} onToggleMute={toggleMute} onToggleCamera={toggleCamera} onToggleSpeaker={toggleSpeaker} onAddParticipant={() => void openParticipantPicker()} mutedExternal={muted} cameraEnabledExternal={cameraEnabled} speakerOnExternal={speakerOn} onLeave={handleEndPress} />
       )}
 

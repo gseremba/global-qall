@@ -60,6 +60,14 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
   const busyRef = useRef(false);
   // Per-mesh-session recovery; the original A-B connection is never touched.
   const recoveryRef = useRef(new Map<string, { generation: number; failedSince: number | null; lastRequestAt: number; attempts: number }>());
+  // Treat sustained ICE disconnection as a recoverable stall, not only terminal failure.
+  const RECOVERY_DISCONNECTED_MS = 20000;
+  const RECOVERY_FAILED_MS = 6000;
+  const RECOVERY_REQUEST_COOLDOWN_MS = 30000;
+  // Display-only peer presence. No membership, SDP, or ICE recovery changes.
+  const peerPresenceRef = useRef(new Map<string, { everConnected: boolean; unavailableSince: number | null }>());
+  const [presenceRevision, setPresenceRevision] = useState(0);
+  const refreshPresence = useCallback(() => { if (!stoppedRef.current) setPresenceRevision(n => n + 1); }, []);
   const [remotes, setRemotes] = useState<Array<{ id: string; stream: MediaStream }>>([]);
   const [state, setState] = useState("Waiting for conference peers…");
   const [ownStream, setOwnStream] = useState<MediaStream | null>(null);
@@ -78,6 +86,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
     for (const runtime of peers.current.values()) { try { runtime.pc.close(); } catch {} }
     peers.current.clear();
     recoveryRef.current.clear();
+    peerPresenceRef.current.clear();
     if (ownedRef.current) streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     ownedRef.current = false;
@@ -88,6 +97,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
     let cancelled = false;
     const tick = async () => {
       if (cancelled || stoppedRef.current || busyRef.current || AppState.currentState !== "active") return;
+      if ([...peerPresenceRef.current.values()].some(p => p.unavailableSince !== null)) refreshPresence();
       busyRef.current = true;
       try {
         const { data: conference, error: confError } = await supabase.from("direct_call_conferences").select("id,status").eq("call_id", callId).maybeSingle();
@@ -128,6 +138,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
         if (!sessions.length) {
           for (const runtime of peers.current.values()) { try { runtime.pc.close(); } catch {} }
           peers.current.clear();
+          peerPresenceRef.current.clear();
           sessionPeersRef.current.clear();
           updateRemotes();
           setState("Waiting for another participant…");
@@ -144,15 +155,15 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
         }
         const activeIds = new Set(sessions.map(s => s.id));
         for (const [id, runtime] of peers.current) {
-          if (!activeIds.has(id)) { runtime.pc.close(); peers.current.delete(id); recoveryRef.current.delete(id); updateRemotes(); }
+          if (!activeIds.has(id)) { runtime.pc.close(); peers.current.delete(id); recoveryRef.current.delete(id); peerPresenceRef.current.delete(id); updateRemotes(); }
         }
         for (const row of sessions) {
           if (cancelled || stoppedRef.current) return;
           let runtime = peers.current.get(row.id);
-          if (runtime && runtime.generation !== row.generation) { runtime.pc.close(); peers.current.delete(row.id); runtime = undefined; updateRemotes(); }
+          if (runtime && runtime.generation !== row.generation) { runtime.pc.close(); peers.current.delete(row.id); peerPresenceRef.current.delete(row.id); runtime = undefined; updateRemotes(); }
           const prior = recoveryRef.current.get(row.id);
           if (!prior) recoveryRef.current.set(row.id, { generation: row.generation, failedSince: null, lastRequestAt: 0, attempts: 0 });
-          else if (prior.generation !== row.generation) { prior.generation = row.generation; prior.failedSince = null; }
+          else if (prior.generation !== row.generation) { prior.generation = row.generation; prior.failedSince = null; prior.attempts = 0; }
           if (!runtime) {
             const pc = new RTCPeerConnection({ iceServers: await iceServers(), iceTransportPolicy: "all" } as any);
             runtime = { pc, generation: row.generation, remote: null, seen: new Set(), pending: [], offered: false, answering: false, answered: false };
@@ -183,14 +194,51 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
               });
               updateRemotes();
             };
+            // React to both ICE and overall peer connectivity. Keep the last
+            // remote stream in memory for recovery, but hide it when disconnected.
+            const updatePresence = () => {
+              if (stoppedRef.current || peers.current.get(sessionId)?.pc !== pc) return;
+              const previous = peerPresenceRef.current.get(sessionId) || { everConnected: false, unavailableSince: null };
+              const connected = pc.connectionState === "connected" || pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed";
+              const unavailable = pc.connectionState === "disconnected" || pc.connectionState === "failed" || pc.connectionState === "closed" ||
+                pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed" || pc.iceConnectionState === "closed";
+              const next = connected
+                ? { everConnected: true, unavailableSince: null }
+                : unavailable && previous.everConnected
+                  ? { everConnected: true, unavailableSince: previous.unavailableSince ?? Date.now() }
+                  : previous;
+              if (next.everConnected !== previous.everConnected || next.unavailableSince !== previous.unavailableSince) {
+                peerPresenceRef.current.set(sessionId, next);
+                refreshPresence();
+              }
+            };
+            pc.oniceconnectionstatechange = () => {
+              updatePresence();
+              // iOS may report ICE disconnection without firing an overall
+              // connection-state change. Start the same bounded recovery clock.
+              if (stoppedRef.current || peers.current.get(sessionId)?.pc !== pc) return;
+              const recovery = recoveryRef.current.get(sessionId);
+              if (!recovery) return;
+              if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+                recovery.failedSince = null;
+                recovery.attempts = 0;
+              } else if ((pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") && recovery.failedSince === null) {
+                recovery.failedSince = Date.now();
+                console.warn("[CONF RECOVERY] ICE connectivity lost", sessionId, generation, pc.iceConnectionState);
+              }
+            };
             pc.onconnectionstatechange = () => {
+              updatePresence();
               if (stoppedRef.current || peers.current.get(sessionId)?.pc !== pc) return;
               const recovery = recoveryRef.current.get(sessionId);
               if (recovery) {
-                if (pc.connectionState === "connected") { recovery.failedSince = null; recovery.attempts = 0; }
-                else if (pc.connectionState === "failed" && recovery.failedSince === null) {
+                const healthy = pc.connectionState === "connected" || pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed";
+                const stalled = pc.connectionState === "disconnected" || pc.connectionState === "failed" ||
+                  pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed";
+                if (healthy) { recovery.failedSince = null; recovery.attempts = 0; }
+                else if (stalled && recovery.failedSince === null) {
                   recovery.failedSince = Date.now();
-                  console.warn("[CONF RECOVERY] Peer failed", sessionId, generation);
+                  console.warn("[CONF RECOVERY] Peer connectivity lost", sessionId, generation, pc.connectionState, pc.iceConnectionState);
                 }
               }
               setState(`Conference peer: ${pc.connectionState}`);
@@ -198,10 +246,14 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
           }
           const pc = runtime.pc;
           const recovery = recoveryRef.current.get(row.id);
-          if (recovery && pc.connectionState === "failed") {
+          const failed = pc.connectionState === "failed" || pc.iceConnectionState === "failed";
+          const disconnected = pc.connectionState === "disconnected" || pc.iceConnectionState === "disconnected";
+          const healthy = pc.connectionState === "connected" || pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed";
+          if (recovery && !healthy && (failed || disconnected)) {
             if (recovery.failedSince === null) recovery.failedSince = Date.now();
             const now = Date.now();
-            if (now - recovery.failedSince >= 6000 && now - recovery.lastRequestAt >= 12000
+            const threshold = failed ? RECOVERY_FAILED_MS : RECOVERY_DISCONNECTED_MS;
+            if (now - recovery.failedSince >= threshold && now - recovery.lastRequestAt >= RECOVERY_REQUEST_COOLDOWN_MS
                 && recovery.attempts < 2 && !cancelled && !stoppedRef.current) {
               recovery.lastRequestAt = now;
               recovery.attempts += 1;
@@ -267,7 +319,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
     void tick();
     const interval = setInterval(() => { void tick(); }, 1500);
     return () => { cancelled = true; clearInterval(interval); closeAll(); };
-  }, [callId, userId, invitee, video, sharedStream, closeAll, updateRemotes]);
+  }, [callId, userId, invitee, video, sharedStream, closeAll, updateRemotes, refreshPresence]);
 
   const local = sharedStream || ownStream;
   const mutedNow = mutedExternal ?? muted;
@@ -293,6 +345,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
   // independent conference mesh has not delivered a video track. Reuse that
   // stream for DISPLAY only; keep conference audio and signaling unchanged.
   // The explicit remote user ID prevents showing B's video in C's tile.
+  void presenceRevision; // Trigger a render as the reconnecting grace period expires.
   const tiles = orderedIds.map((id, index) => {
     const isSelf = id === userId;
     const conferenceStream = isSelf ? null : remoteById.get(id) || null;
@@ -431,20 +484,32 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
     ) : (
     <View style={[styles.stage, landscape && styles.stageLandscape]}>
       {tiles.map((tile, index) => {
-        const activeVideo = Boolean(video && tile.stream && (!tile.isSelf || cameraNow) && tile.stream.getVideoTracks().length);
+        // Presence is advisory UI only; the authoritative roster remains unchanged.
+        // The original A-B direct stream is never hidden by mesh presence.
+        const sessionId = [...sessionPeersRef.current.entries()].find(([, pair]) =>
+          (pair.peer_a_id === userId && pair.peer_b_id === tile.id) ||
+          (pair.peer_b_id === userId && pair.peer_a_id === tile.id))?.[0];
+        const presence = sessionId ? peerPresenceRef.current.get(sessionId) : undefined;
+        const offlineFor = presence?.unavailableSince == null ? 0 : Date.now() - presence.unavailableSince;
+        const disconnected = !tile.isSelf && tile.videoSource === "conference-mesh" && offlineFor >= 10000;
+        const reconnecting = !tile.isSelf && tile.videoSource === "conference-mesh" && offlineFor > 0 && offlineFor < 10000;
+        const activeVideo = Boolean(!disconnected && !reconnecting && video && tile.stream && (!tile.isSelf || cameraNow) && tile.stream.getVideoTracks().some(t => t.readyState === "live"));
         return <View key={tile.id} style={[styles.tile, landscape && styles.landscapeTile]}>
           {activeVideo ? <RTCView streamURL={tile.stream!.toURL()} style={styles.video} objectFit="cover" mirror={tile.isSelf} /> :
-            <View style={styles.placeholder}><Ionicons name={video ? "person" : "mic"} size={42} color="#E2E8F0" /></View>}
+            <View style={styles.placeholder}>
+              <Ionicons name={disconnected ? "cloud-offline-outline" : reconnecting ? "sync-outline" : "person"} size={42} color="#E2E8F0" />
+              {(disconnected || reconnecting) && <Text style={styles.presenceText}>{disconnected ? "Disconnected" : "Reconnecting…"}</Text>}
+            </View>}
           <View style={styles.nameTag}><Text style={styles.tileText}>{tile.isSelf ? "You" : `Participant ${index + 1}`}</Text></View>
         </View>;
       })}
     </View>
     )}
-    {!video && !invitee && originalIds.includes(userId) && <Pressable accessibilityRole="button" accessibilityLabel="Manage conference participants" onPress={() => setManageOpen(true)} style={styles.manageButton}>
+    {!invitee && originalIds.includes(userId) && <Pressable accessibilityRole="button" accessibilityLabel="Manage conference participants" onPress={() => setManageOpen(true)} style={styles.manageButton}>
       <Ionicons name="people-outline" size={18} color="#FFFFFF" />
       <Text style={styles.manageText}>Manage participants</Text>
     </Pressable>}
-    <Modal visible={manageOpen && !video} transparent animationType="fade" onRequestClose={() => setManageOpen(false)}>
+    <Modal visible={manageOpen} transparent animationType="fade" onRequestClose={() => setManageOpen(false)}>
       <View style={styles.manageBackdrop}>
         <View style={styles.managePanel}>
           <Text style={styles.manageHeading}>Conference participants</Text>
@@ -518,6 +583,7 @@ const styles = StyleSheet.create({
   landscapeTile: { flex: 1, width: undefined, height: "92%" },
   video: { width: "100%", height: "100%" },
   placeholder: { flex: 1, alignItems: "center", justifyContent: "center" },
+  presenceText: { color: "#E2E8F0", fontSize: 12, fontWeight: "700", marginTop: 8 },
   nameTag: { position: "absolute", bottom: 7, left: 7, backgroundColor: "rgba(15,23,42,0.75)", paddingHorizontal: 9, paddingVertical: 5, borderRadius: 8 },
   tileText: { color: "white", fontSize: 12, fontWeight: "700" },
   audioScroll: { flex: 1, minHeight: 0 },

@@ -31,7 +31,7 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
   // activate the microphone/camera until the user explicitly chooses Rejoin.
   const [recoverable, setRecoverable] = useState<{ callId: string; invitationId: string; conferenceId: string; video: boolean } | null>(null);
   const [recoveryWorking, setRecoveryWorking] = useState(false);
-  const recoveryCheckedUserRef = useRef<string | null>(null);
+  const recoverySuppressedRef = useRef(new Set<string>());
   const acceptedCallIdRef = useRef<string | null>(null);
   // Track the specific accepted invitation so an old LEFT membership cannot
   // dismiss a new re-invitation before A/B reactivates it.
@@ -117,14 +117,20 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
     };
   }, [user?.id, refresh]);
 
-  // One-time startup lookup only. Do NOT poll accepted invitations: that could
-  // resurrect a conference after the user deliberately presses Leave.
+  // Bounded cold-start recovery: authentication, conference membership, and the
+  // call-type RPC may not all be ready during the first app-launch query.
+  // Never continuously poll accepted invites (or resurrect an intentional Leave).
   useEffect(() => {
-    if (!user?.id) { recoveryCheckedUserRef.current = null; setRecoverable(null); return; }
-    if (recoveryCheckedUserRef.current === user.id) return;
-    recoveryCheckedUserRef.current = user.id;
+    if (!user?.id) { setRecoverable(null); recoverySuppressedRef.current.clear(); return; }
     let cancelled = false;
+    let checking = false;
+    let completed = false;
+    let attempts = 0;
+    const maxAttempts = 12; // up to ~36 seconds, then stop
     const recover = async () => {
+      if (cancelled || completed || checking || acceptedCallIdRef.current || AppState.currentState !== "active") return;
+      checking = true;
+      attempts += 1;
       try {
         const { data: invitations, error } = await supabase.from("conference_invitations")
           .select("id,call_id,created_at")
@@ -133,6 +139,7 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
         if (error) throw error;
         for (const invitation of invitations || []) {
           if (cancelled || acceptedCallIdRef.current) return;
+          if (recoverySuppressedRef.current.has(invitation.id)) continue;
           const { data: conference, error: confError } = await supabase.from("direct_call_conferences")
             .select("id,status").eq("call_id", invitation.call_id).maybeSingle();
           if (confError) throw confError;
@@ -143,8 +150,6 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
           if (memberError) throw memberError;
           if (!member || member.invitation_id !== invitation.id ||
               !["ready", "joined", "active"].includes(member.status)) continue;
-          // Calls can be hidden from invitees by RLS. A visible terminal call
-          // is disqualifying; a hidden call is not proof that it has ended.
           const { data: call, error: callError } = await supabase.from("calls")
             .select("status").eq("id", invitation.call_id).maybeSingle();
           if (callError) throw callError;
@@ -153,17 +158,38 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
           const { data: callType, error: typeError } = await supabase.rpc("get_conference_invite_call_type", {
             requested_invitation_id: invitation.id,
           });
-          if (typeError) { console.warn("[CONF RECOVERY] Call type lookup:", typeError.message); continue; }
+		  
+          console.log("[AUDIO REJOIN DEBUG]", {
+            authenticatedUserId: user.id,
+            invitationId: invitation.id,
+            callId: invitation.call_id,
+            callType,
+            error: typeError?.message ?? null,
+          });		  
+		  
+          if (typeError || (callType !== "audio" && callType !== "video")) {
+            console.warn("[CONF RECOVERY] Call type unavailable", {
+              invitationId: invitation.id, type: callType, error: typeError?.message ?? null,
+            });
+            continue; // Do not guess audio/video or enable the wrong media.
+          }
           if (cancelled || acceptedCallIdRef.current) return;
-          if (callType !== "audio" && callType !== "video") continue;
+          completed = true;
+          console.log("[CONF RECOVERY] Eligible conference", { invitationId: invitation.id, type: callType, attempt: attempts });
           setRecoverable({ callId: invitation.call_id, invitationId: invitation.id,
             conferenceId: conference.id, video: callType === "video" });
           return;
         }
+        if (attempts === maxAttempts) console.warn("[CONF RECOVERY] No eligible conference after startup retries");
       } catch (e) { console.warn("[CONF RECOVERY] Startup lookup:", e); }
+      finally { checking = false; }
     };
     void recover();
-    return () => { cancelled = true; };
+    const interval = setInterval(() => {
+      if (attempts >= maxAttempts || completed) { clearInterval(interval); return; }
+      void recover();
+    }, 3000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [user?.id]);
 
   const rejoinRecovered = async () => {
@@ -211,6 +237,7 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
         .update({ status: "left" }).eq("conference_id", target.conferenceId)
         .eq("user_id", user.id).eq("invitation_id", target.invitationId);
       if (error) throw error;
+      recoverySuppressedRef.current.add(target.invitationId);
       setRecoverable(null);
     } catch (e) {
       Alert.alert("Could not dismiss", "Unable to update conference membership. Please try again.");
@@ -376,7 +403,7 @@ export function IncomingConferenceInviteProvider({ children }: PropsWithChildren
         userId={user.id}
         invitee
         video={conferenceVideo}
-        onLeave={() => { acceptedCallIdRef.current = null; acceptedInvitationIdRef.current = null; setMembershipReady(false); }}
+        onLeave={() => { if (acceptedInvitationIdRef.current) recoverySuppressedRef.current.add(acceptedInvitationIdRef.current); acceptedCallIdRef.current = null; acceptedInvitationIdRef.current = null; setMembershipReady(false); }}
       />
     )}
     <Modal visible={Boolean(recoverable) && !incoming && !membershipReady} transparent animationType="fade" statusBarTranslucent onRequestClose={() => {}}>

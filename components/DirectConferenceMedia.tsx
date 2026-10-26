@@ -545,7 +545,7 @@ export function DirectConferenceMedia({ callId, userId, sharedStream, originalRe
         <View style={[styles.controlCircle, speakerNow && styles.controlActive]}><Ionicons name={speakerNow ? "volume-high" : "volume-medium"} size={24} color="white" /></View>
         <Text style={styles.controlText}>Speaker</Text>
       </Pressable>
-      {!video && onAddParticipant && <Pressable accessibilityRole="button" accessibilityLabel="Add participant" onPress={onAddParticipant} style={styles.control}>
+      {onAddParticipant && <Pressable accessibilityRole="button" accessibilityLabel="Add participant" onPress={onAddParticipant} style={styles.control}>
         <View style={styles.controlCircle}><Ionicons name="person-add" size={23} color="white" /></View>
         <Text style={styles.controlText}>Add</Text>
       </Pressable>}
